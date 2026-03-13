@@ -1,12 +1,14 @@
 /**
  * Tests for the OpenClaw TypeScript plugin entry point.
  *
- * Tests the register() function and the hooks it registers:
+ * Tests the plugin definition object and its register() method:
+ *   - Object export form: { id, name, configSchema, register(api) }
  *   - tool_call:before (routing enforcement)
  *   - tool_call:after (session event capture)
  *   - command:new (session initialization)
  *   - before_prompt_build (routing instruction injection)
  *   - context-mode context engine (compaction management)
+ *   - ctx slash commands (ctx-stats, ctx-doctor, ctx-upgrade)
  */
 
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
@@ -38,15 +40,25 @@ interface MockContextEngine {
   };
 }
 
+interface MockCommandEntry {
+  name: string;
+  description: string;
+  acceptsArgs?: boolean;
+  requireAuth?: boolean;
+  handler: (ctx: Record<string, unknown>) => { text: string } | Promise<{ text: string }>;
+}
+
 function createMockApi() {
   const hooks: MockHookEntry[] = [];
   const lifecycle: MockLifecycleEntry[] = [];
   const contextEngines: MockContextEngine[] = [];
+  const commands: MockCommandEntry[] = [];
 
   return {
     hooks,
     lifecycle,
     contextEngines,
+    commands,
     api: {
       registerHook(
         event: string,
@@ -68,6 +80,9 @@ function createMockApi() {
       ) {
         contextEngines.push({ id, factory: factory as MockContextEngine["factory"] });
       },
+      registerCommand(cmd: MockCommandEntry) {
+        commands.push(cmd);
+      },
     },
   };
 }
@@ -77,9 +92,9 @@ function createMockApi() {
  * Returns the mock API state and helper functions.
  */
 async function createTestPlugin(tempDir: string) {
-  const { default: register } = await import("../src/openclaw-plugin.js");
+  const { default: plugin } = await import("../src/openclaw-plugin.js");
   const mock = createMockApi();
-  await register(mock.api);
+  await plugin.register(mock.api);
   return mock;
 }
 
@@ -96,6 +111,26 @@ describe("OpenClawPlugin", () => {
     try {
       rmSync(tempDir, { recursive: true, force: true });
     } catch { /* cleanup best effort */ }
+  });
+
+  // ── Object export form ────────────────────────────────
+
+  describe("object export", () => {
+    it("exports object with id, name, configSchema, register", async () => {
+      const { default: plugin } = await import("../src/openclaw-plugin.js");
+      expect(plugin.id).toBe("context-mode");
+      expect(plugin.name).toBe("Context Mode");
+      expect(plugin.configSchema).toBeDefined();
+      expect(plugin.configSchema.type).toBe("object");
+      expect(typeof plugin.register).toBe("function");
+    });
+
+    it("configSchema has enabled property", async () => {
+      const { default: plugin } = await import("../src/openclaw-plugin.js");
+      expect(plugin.configSchema.properties.enabled).toBeDefined();
+      expect(plugin.configSchema.properties.enabled.type).toBe("boolean");
+      expect(plugin.configSchema.properties.enabled.default).toBe(true);
+    });
   });
 
   // ── Registration ──────────────────────────────────────
@@ -137,6 +172,56 @@ describe("OpenClawPlugin", () => {
         expect(hook.meta.name).toMatch(/^context-mode\./);
         expect(hook.meta.description.length).toBeGreaterThan(0);
       }
+    });
+  });
+
+  // ── Auto-reply commands ───────────────────────────────
+
+  describe("auto-reply commands", () => {
+    it("registers ctx-stats command", async () => {
+      const mock = await createTestPlugin(join(tempDir, "cmd-stats"));
+      const statsCmd = mock.commands.find((c) => c.name === "ctx-stats");
+      expect(statsCmd).toBeDefined();
+      expect(statsCmd!.description).toContain("statistics");
+    });
+
+    it("registers ctx-doctor command", async () => {
+      const mock = await createTestPlugin(join(tempDir, "cmd-doctor"));
+      const doctorCmd = mock.commands.find((c) => c.name === "ctx-doctor");
+      expect(doctorCmd).toBeDefined();
+      expect(doctorCmd!.description).toContain("diagnostics");
+    });
+
+    it("registers ctx-upgrade command", async () => {
+      const mock = await createTestPlugin(join(tempDir, "cmd-upgrade"));
+      const upgradeCmd = mock.commands.find((c) => c.name === "ctx-upgrade");
+      expect(upgradeCmd).toBeDefined();
+      expect(upgradeCmd!.description).toContain("Upgrade");
+    });
+
+    it("ctx-stats handler returns session stats text", async () => {
+      const mock = await createTestPlugin(join(tempDir, "cmd-stats-run"));
+      const statsCmd = mock.commands.find((c) => c.name === "ctx-stats");
+      const result = await statsCmd!.handler({});
+      expect(result.text).toContain("context-mode stats");
+      expect(result.text).toContain("Events captured:");
+    });
+
+    it("ctx-doctor handler returns diagnostics command", async () => {
+      const mock = await createTestPlugin(join(tempDir, "cmd-doctor-run"));
+      const doctorCmd = mock.commands.find((c) => c.name === "ctx-doctor");
+      const result = await doctorCmd!.handler({});
+      expect(result.text).toContain("ctx-doctor");
+      expect(result.text).toContain("doctor");
+    });
+
+    it("ctx-upgrade handler returns upgrade command", async () => {
+      const mock = await createTestPlugin(join(tempDir, "cmd-upgrade-run"));
+      const upgradeCmd = mock.commands.find((c) => c.name === "ctx-upgrade");
+      const result = await upgradeCmd!.handler({});
+      expect(result.text).toContain("ctx-upgrade");
+      expect(result.text).toContain("upgrade");
+      expect(result.text).toContain("Restart");
     });
   });
 
