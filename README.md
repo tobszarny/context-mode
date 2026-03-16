@@ -268,13 +268,27 @@ This works alongside the plugin as a parallel enforcement layer — the plugin i
 <details>
 <summary><strong>OpenClaw / Pi Agent</strong> <sup>(Beta)</sup></summary>
 
-context-mode integrates with [OpenClaw](https://github.com/openclaw) as a native gateway plugin, targeting **Pi Agent** (OpenClaw's coding agent with Read/Write/Edit/Bash tools).
+**Prerequisites:** OpenClaw gateway running ([>2026.1.29](https://github.com/openclaw/openclaw/pull/9761)), Node.js 22+.
+
+context-mode runs as a native [OpenClaw](https://github.com/openclaw) gateway plugin, targeting **Pi Agent** sessions (Read/Write/Edit/Bash tools). Unlike other platforms, there's no separate MCP server — the plugin registers directly into the gateway runtime via OpenClaw's [plugin API](https://docs.openclaw.ai/tools/plugin).
+
+**Step 1 — Run the installer:**
 
 ```bash
-scripts/install-openclaw-plugin.sh [OPENCLAW_STATE_DIR]
+scripts/install-openclaw-plugin.sh /path/to/openclaw-state
 ```
 
-The installer builds the plugin, rebuilds `better-sqlite3` for the system Node version, registers the extension, and restarts the gateway. Hooks are registered automatically via `api.on()` (lifecycle/tool hooks) and `api.registerHook()` (command hooks).
+Replace `/path/to/openclaw-state` with your `OPENCLAW_STATE_DIR` — the directory containing `runtime/openclaw.runtime.json`. Common locations:
+- **Docker:** `/openclaw` (the installer default)
+- **Local:** `~/.openclaw` or wherever you set `OPENCLAW_STATE_DIR`
+
+The installer builds the plugin, rebuilds `better-sqlite3` for your system Node, registers the extension in `runtime.json`, and restarts the gateway via SIGUSR1.
+
+**Step 2 — Verify.** Open a Pi Agent session. The plugin auto-injects `AGENTS.md` routing instructions and registers 8 hooks via [`api.on()`](https://docs.openclaw.ai/tools/plugin) (lifecycle) and [`api.registerHook()`](https://docs.openclaw.ai/tools/plugin) (commands). All tool interception, session tracking, and compaction recovery hooks activate automatically — no manual hook configuration needed.
+
+> **Why native plugin?** OpenClaw doesn't support shell-based hooks like Claude Code or Gemini CLI. Instead, plugins register TypeScript functions directly into the gateway runtime. This gives full access to tool interception, argument mutation, and session context injection — equivalent to the hook-based approach on other platforms.
+>
+> **Minimum version:** OpenClaw >2026.1.29 — this includes the `api.on()` lifecycle fix from [PR #9761](https://github.com/openclaw/openclaw/pull/9761). On older versions, lifecycle hooks silently fail. The adapter falls back to DB snapshot reconstruction (less precise but preserves critical state).
 
 Full documentation: [`docs/adapters/openclaw.md`](docs/adapters/openclaw.md)
 
@@ -592,7 +606,7 @@ Hooks intercept tool calls programmatically — they can block dangerous command
 | VS Code Copilot | Yes | [`copilot-instructions.md`](configs/vscode-copilot/copilot-instructions.md) | **~98% saved** | ~60% saved |
 | Cursor | Yes | -- | **~98% saved** | Manual tool choice |
 | OpenCode | Plugin | [`AGENTS.md`](configs/opencode/AGENTS.md) | **~98% saved** | ~60% saved |
-| OpenClaw | Plugin | [`CLAUDE.md`](configs/claude-code/CLAUDE.md) | **~98% saved** | ~60% saved |
+| OpenClaw | Plugin | [`AGENTS.md`](configs/openclaw/AGENTS.md) | **~98% saved** | ~60% saved |
 | Codex CLI | -- | [`AGENTS.md`](configs/codex/AGENTS.md) | -- | ~60% saved |
 | Antigravity | -- | [`GEMINI.md`](configs/antigravity/GEMINI.md) | -- | ~60% saved |
 | Kiro | -- | [`KIRO.md`](configs/kiro/KIRO.md) | -- | ~60% saved |
