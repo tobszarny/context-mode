@@ -174,7 +174,7 @@ export class PolyglotExecutor {
     try {
       execSync(`rustc ${srcPath} -o ${binPath}`, {
         cwd,
-        timeout: Math.min(timeout, 30_000),
+        timeout: Math.min(timeout, 60_000),
         encoding: "utf-8",
         stdio: ["pipe", "pipe", "pipe"],
       });
