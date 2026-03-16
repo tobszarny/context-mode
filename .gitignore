@@ -7,7 +7,6 @@ packages/*/dist/
 *.db
 server.bundle.mjs
 cli.bundle.mjs
-stats.json
 package-lock.json
 hooks/session-extract.bundle.mjs
 hooks/session-snapshot.bundle.mjs
