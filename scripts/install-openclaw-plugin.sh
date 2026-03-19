@@ -6,7 +6,7 @@
 set -euo pipefail
 
 PLUGIN_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-OPENCLAW_STATE_DIR="${1:-/openclaw}"
+OPENCLAW_STATE_DIR="${1:-${OPENCLAW_STATE_DIR:-/openclaw}}"
 
 # — preflight checks —
 if ! command -v node &>/dev/null; then

@@ -322,20 +322,13 @@ To test against a running OpenClaw gateway:
 
 1. Install the plugin:
    ```bash
-   scripts/install-openclaw-plugin.sh [OPENCLAW_STATE_DIR]
+   npm run install:openclaw
+   # Or with a custom state directory:
+   npm run install:openclaw -- /path/to/openclaw-state
    ```
+   The script picks up `$OPENCLAW_STATE_DIR` from your environment (default: `/openclaw`). It handles building, native dependency rebuild, extension registration, and gateway restart in one step.
 
-2. Rebuild native dependencies for the system Node version:
-   ```bash
-   npm rebuild better-sqlite3
-   ```
-
-3. Restart the gateway (SIGUSR1 triggers config reload):
-   ```bash
-   kill -USR1 $(pgrep -f "node.*openclaw/dist/index.js")
-   ```
-
-4. Open a Pi Agent session and verify hooks fire by checking the debug log output.
+2. Open a Pi Agent session and verify hooks fire by checking the debug log output.
 
 See [`docs/adapters/openclaw.md`](docs/adapters/openclaw.md) for hook registration details and known upstream issues.
 
