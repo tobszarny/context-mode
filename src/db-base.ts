@@ -110,29 +110,18 @@ export class BunSQLiteAdapter {
 let _Database: typeof DatabaseConstructor | null = null;
 
 /**
- * Lazy-load better-sqlite3. Falls back to bun:sqlite via BunSQLiteAdapter
- * when better-sqlite3 is unavailable (Bun runtime, issue #45).
+ * Lazy-load the SQLite driver for the current runtime.
+ * Bun → bun:sqlite via BunSQLiteAdapter (issue #45).
+ * Node → better-sqlite3 (native addon).
  */
 export function loadDatabase(): typeof DatabaseConstructor {
   if (!_Database) {
     const require = createRequire(import.meta.url);
-    try {
-      const mod = require("better-sqlite3");
-      // Bun's require("better-sqlite3") doesn't throw — returns undefined (#163).
-      // Validate the result is a usable constructor before assigning.
-      if (!mod || typeof mod !== "function") {
-        throw new Error("better-sqlite3 loaded but not usable (Bun compatibility issue)");
-      }
-      _Database = mod as typeof DatabaseConstructor;
-    } catch {
-      // better-sqlite3 unavailable (Bun runtime) — wrap bun:sqlite
-      if (!(globalThis as any).Bun) {
-        throw new Error("better-sqlite3 failed to load and Bun runtime not detected");
-      }
-      // Compute module name at runtime to prevent esbuild from resolving at bundle time.
-      // esbuild constant-folds string concat but NOT Array.join().
-      const bunSqliteMod = ["bun", "sqlite"].join(":");
-      const BunDB = require(bunSqliteMod).Database;
+
+    if ((globalThis as any).Bun) {
+      // Bun runtime — use bun:sqlite directly.
+      // Array.join() prevents esbuild from resolving the specifier at bundle time.
+      const BunDB = require(["bun", "sqlite"].join(":")).Database;
       _Database = function BunDatabaseFactory(path: string, opts?: any) {
         const raw = new BunDB(path, {
           readonly: opts?.readonly,
@@ -140,6 +129,9 @@ export function loadDatabase(): typeof DatabaseConstructor {
         });
         return new BunSQLiteAdapter(raw);
       } as any;
+    } else {
+      // Node.js — use better-sqlite3.
+      _Database = require("better-sqlite3") as typeof DatabaseConstructor;
     }
   }
   return _Database!;
