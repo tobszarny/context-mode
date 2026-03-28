@@ -593,7 +593,7 @@ export default {
       info: {
         id: "context-mode",
         name: "Context Mode",
-        ownsCompaction: true,
+        ownsCompaction: false,
       },
 
       async ingest() {
@@ -604,32 +604,12 @@ export default {
         return { messages, estimatedTokens: 0 };
       },
 
-      async compact({ currentTokenCount }: { currentTokenCount?: number } = {}) {
-        try {
-          const sid = sessionId;
-          const events = db.getEvents(sid);
-          if (events.length === 0) return { ok: true, compacted: false };
-
-          const stats = db.getSessionStats(sid);
-          const compactCount = (stats?.compact_count ?? 0) + 1;
-          const snapshot = buildResumeSnapshot(events, { compactCount });
-
-          db.upsertResume(sid, snapshot, events.length);
-          db.incrementCompactCount(sid);
-
-          return {
-            ok: true,
-            compacted: true,
-            result: {
-              summary: snapshot,
-              firstKeptEntryId: "",   // clear all history before this compaction
-              tokensBefore: currentTokenCount ?? 0,
-              tokensAfter: 0,
-            },
-          };
-        } catch {
-          return { ok: false, compacted: false };
-        }
+      async compact() {
+        // No-op: session continuity is handled by before_compaction / after_compaction hooks.
+        // Returning ownsCompaction: false + compacted: false lets the host platform (OpenClaw)
+        // manage conversation truncation, preserving Anthropic thinking/redacted_thinking blocks.
+        // See: https://github.com/mksglu/context-mode/issues/191
+        return { ok: true, compacted: false };
       },
     }));
 
