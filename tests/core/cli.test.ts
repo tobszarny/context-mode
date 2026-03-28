@@ -779,3 +779,14 @@ describe("Shell-free upgrade (#185)", () => {
     expect(inlineSection).not.toMatch(/(?<!File)execSync/);
   });
 });
+
+// ── Issue #186: temp dirs must be dot-prefixed to hide from VS Code ──
+
+describe("Hidden temp dirs (#186)", () => {
+  test("executor.ts uses dot-prefixed temp dir to avoid VS Code auto-open", () => {
+    const EXEC_SOURCE = readFileSync(resolve(ROOT, "src/executor.ts"), "utf-8");
+    // Must use .ctx-mode- prefix (dot-hidden) not ctx-mode-
+    expect(EXEC_SOURCE).toContain('.ctx-mode-');
+    expect(EXEC_SOURCE).not.toMatch(/tmpdir\(\),\s*"ctx-mode-"/);
+  });
+});
