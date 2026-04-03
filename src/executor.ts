@@ -52,6 +52,9 @@ interface ExecuteOptions {
   timeout?: number;
   /** Keep process running after timeout instead of killing it. */
   background?: boolean;
+  /** Env vars to inherit from the parent process (e.g. ['TMPDIR']).
+   *  Security-critical variables (NODE_OPTIONS, LD_PRELOAD, etc.) are always blocked. */
+  inheritEnvKeys?: string[];
 }
 
 interface ExecuteFileOptions extends ExecuteOptions {
@@ -92,7 +95,7 @@ export class PolyglotExecutor {
   }
 
   async execute(opts: ExecuteOptions): Promise<ExecResult> {
-    const { language, code, timeout = 30_000, background = false } = opts;
+    const { language, code, timeout = 30_000, background = false, inheritEnvKeys } = opts;
     const tmpDir = mkdtempSync(join(OS_TMPDIR, ".ctx-mode-"));
 
     try {
@@ -108,7 +111,7 @@ export class PolyglotExecutor {
       // and other project-aware tools work naturally. Non-shell languages
       // run in the temp directory where their script file is written.
       const cwd = language === "shell" ? this.#projectRoot : tmpDir;
-      const result = await this.#spawn(cmd, cwd, tmpDir, timeout, background);
+      const result = await this.#spawn(cmd, cwd, tmpDir, timeout, background, inheritEnvKeys);
 
       // Skip tmpDir cleanup if process was backgrounded — it may still need files
       if (!result.backgrounded) {
@@ -213,6 +216,7 @@ export class PolyglotExecutor {
     sandboxTmpDir: string,
     timeout: number,
     background = false,
+    inheritEnvKeys?: string[],
   ): Promise<ExecResult> {
     return new Promise((res) => {
       // Only .cmd/.bat shims need shell on Windows; real executables don't.
@@ -236,7 +240,7 @@ export class PolyglotExecutor {
       const proc = spawn(spawnCmd, spawnArgs, {
         cwd,
         stdio: ["ignore", "pipe", "pipe"],
-        env: this.#buildSafeEnv(sandboxTmpDir),
+        env: this.#buildSafeEnv(sandboxTmpDir, inheritEnvKeys),
         shell: needsShell,
         // On Unix, create a new process group so killTree can kill all children
         detached: !isWin,
@@ -330,7 +334,7 @@ export class PolyglotExecutor {
     });
   }
 
-  #buildSafeEnv(tmpDir: string): Record<string, string> {
+  #buildSafeEnv(tmpDir: string, inheritEnvKeys?: string[]): Record<string, string> {
     const realHome = process.env.HOME ?? process.env.USERPROFILE ?? tmpDir;
 
     // Denylist: env vars that corrupt sandbox stdout, inject code, or break
@@ -455,6 +459,17 @@ export class PolyglotExecutor {
         if (existsSync(p)) {
           env["SSL_CERT_FILE"] = p;
           break;
+        }
+      }
+    }
+
+    // Apply user-requested env var inheritance (blocked by DENIED set).
+    // This runs AFTER sandbox overrides so callers can opt-in to inheriting
+    // the parent's value for vars like TMPDIR (needed for Gradle daemon, etc.).
+    if (inheritEnvKeys?.length) {
+      for (const key of inheritEnvKeys) {
+        if (!DENIED.has(key) && process.env[key] !== undefined) {
+          env[key] = process.env[key]!;
         }
       }
     }
