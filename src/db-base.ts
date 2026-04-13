@@ -9,7 +9,7 @@
 import type DatabaseConstructor from "better-sqlite3";
 import type { Database as DatabaseInstance } from "better-sqlite3";
 import { createRequire } from "node:module";
-import { unlinkSync, renameSync } from "node:fs";
+import { existsSync, unlinkSync, renameSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -256,6 +256,19 @@ export function applyWALPragmas(db: DatabaseInstance): void {
 // ─────────────────────────────────────────────────────────
 
 /**
+ * Remove orphaned WAL/SHM files when the main DB file doesn't exist.
+ * On Windows, stale -wal/-shm files from crashed processes cause
+ * "file is not a database" errors when creating a fresh DB.
+ */
+export function cleanOrphanedWALFiles(dbPath: string): void {
+  if (!existsSync(dbPath)) {
+    for (const suffix of ["-wal", "-shm"]) {
+      try { unlinkSync(dbPath + suffix); } catch { /* ignore */ }
+    }
+  }
+}
+
+/**
  * Delete all three SQLite files for a given db path (main, WAL, SHM).
  * Silently ignores individual deletion errors so a partial cleanup
  * does not abort the rest.
@@ -407,6 +420,7 @@ export abstract class SQLiteBase {
   constructor(dbPath: string) {
     const Database = loadDatabase();
     this.#dbPath = dbPath;
+    cleanOrphanedWALFiles(dbPath);
     let db: DatabaseInstance;
     try {
       db = new Database(dbPath, { timeout: 30000 });
@@ -415,6 +429,7 @@ export abstract class SQLiteBase {
       const msg = err instanceof Error ? err.message : String(err);
       if (isSQLiteCorruptionError(msg)) {
         renameCorruptDB(dbPath);
+        cleanOrphanedWALFiles(dbPath);
         try {
           db = new Database(dbPath, { timeout: 30000 });
           applyWALPragmas(db);

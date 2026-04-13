@@ -9,7 +9,7 @@
  */
 
 import type { Database as DatabaseInstance } from "better-sqlite3";
-import { loadDatabase, applyWALPragmas, closeDB, withRetry, deleteDBFiles, isSQLiteCorruptionError } from "./db-base.js";
+import { loadDatabase, applyWALPragmas, closeDB, cleanOrphanedWALFiles, withRetry, deleteDBFiles, isSQLiteCorruptionError } from "./db-base.js";
 import type { PreparedStatement } from "./db-base.js";
 import { readFileSync, readdirSync, unlinkSync, existsSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -302,6 +302,7 @@ export class ContentStore {
     const Database = loadDatabase();
     this.#dbPath =
       dbPath ?? join(tmpdir(), `context-mode-${process.pid}.db`);
+    cleanOrphanedWALFiles(this.#dbPath);
     let db: DatabaseInstance;
     try {
       db = new Database(this.#dbPath, { timeout: 30000 });
@@ -310,6 +311,7 @@ export class ContentStore {
       const msg = err instanceof Error ? err.message : String(err);
       if (isSQLiteCorruptionError(msg)) {
         deleteDBFiles(this.#dbPath);
+        cleanOrphanedWALFiles(this.#dbPath);
         try {
           db = new Database(this.#dbPath, { timeout: 30000 });
           applyWALPragmas(db);
