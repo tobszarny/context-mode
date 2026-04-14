@@ -422,13 +422,17 @@ async function doctor(): Promise<number> {
  * ------------------------------------------------------- */
 
 async function insight(port: number) {
+  try {
   const { execSync, spawn } = await import("node:child_process");
   const { statSync, mkdirSync, cpSync } = await import("node:fs");
 
   const insightSource = resolve(getPluginRoot(), "insight");
-  // Adapter-agnostic cache: use ~/.claude/context-mode/insight-cache as default
-  // (matches server.ts pattern but CLI doesn't have adapter detection)
-  const cacheDir = join(homedir(), ".claude", "context-mode", "insight-cache");
+  // Detect platform + adapter for correct session/content paths
+  const detection = detectPlatform();
+  const adapter = await getAdapter(detection.platform);
+  const sessDir = adapter.getSessionDir();
+  const contentDir = join(dirname(sessDir), "content");
+  const cacheDir = join(dirname(sessDir), "insight-cache");
 
   if (!existsSync(join(insightSource, "server.mjs"))) {
     console.error("Error: Insight source not found. Try upgrading context-mode.");
@@ -449,9 +453,15 @@ async function insight(port: number) {
   // Install deps
   if (!existsSync(join(cacheDir, "node_modules"))) {
     console.log("Installing dependencies (first run)...");
-    execSync("npm install --production=false", { cwd: cacheDir, stdio: "inherit", timeout: 300000 });
+    try {
+      execSync("npm install --production=false", { cwd: cacheDir, stdio: "inherit", timeout: 300000 });
+    } catch {
+      // Clean up partial install so next run retries fresh
+      try { rmSync(join(cacheDir, "node_modules"), { recursive: true, force: true }); } catch {}
+      throw new Error("npm install failed — please retry");
+    }
     // Sentinel check: verify install completed (cold cache can timeout leaving partial node_modules)
-    if (!existsSync(join(cacheDir, "node_modules", "vite"))) {
+    if (!existsSync(join(cacheDir, "node_modules", "vite")) || !existsSync(join(cacheDir, "node_modules", "better-sqlite3"))) {
       rmSync(join(cacheDir, "node_modules"), { recursive: true, force: true });
       throw new Error("npm install incomplete — please retry");
     }
@@ -470,11 +480,12 @@ async function insight(port: number) {
     env: {
       ...process.env,
       PORT: String(port),
-      INSIGHT_SESSION_DIR: join(homedir(), ".claude", "context-mode", "sessions"),
-      INSIGHT_CONTENT_DIR: join(homedir(), ".claude", "context-mode", "content"),
+      INSIGHT_SESSION_DIR: sessDir,
+      INSIGHT_CONTENT_DIR: contentDir,
     },
     stdio: "inherit",
   });
+  child.on("error", () => {}); // prevent unhandled error crash
 
   // Wait for server to be ready, then verify it started
   await new Promise(r => setTimeout(r, 1500));
@@ -493,7 +504,7 @@ async function insight(port: number) {
   } catch {
     console.error(`\nError: Port ${port} appears to be in use. Either a previous dashboard is still running, or another service is using this port.`);
     console.error(`\nTo fix:`);
-    console.error(`  Kill the existing process: lsof -ti:${port} | xargs kill`);
+    console.error(`  Kill the existing process: ${process.platform === "win32" ? `netstat -ano | findstr :${port}` : `lsof -ti:${port} | xargs kill`}`);
     console.error(`  Or use a different port:   context-mode insight ${port + 1}`);
     child.kill();
     process.exit(1);
@@ -510,6 +521,11 @@ async function insight(port: number) {
   // Keep alive until Ctrl+C
   process.on("SIGINT", () => { child.kill(); process.exit(0); });
   process.on("SIGTERM", () => { child.kill(); process.exit(0); });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`\nInsight error: ${msg}`);
+    process.exit(1);
+  }
 }
 
 /* -------------------------------------------------------

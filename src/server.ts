@@ -2134,13 +2134,19 @@ server.registerTool(
       const hasNodeModules = existsSync(join(cacheDir, "node_modules"));
       if (!hasNodeModules) {
         steps.push("Installing dependencies (first run, ~30s)...");
-        execSync("npm install --production=false", {
-          cwd: cacheDir,
-          stdio: "pipe",
-          timeout: 300000,
-        });
+        try {
+          execSync("npm install --production=false", {
+            cwd: cacheDir,
+            stdio: "pipe",
+            timeout: 300000,
+          });
+        } catch {
+          // Clean up partial install so next run retries fresh
+          try { rmSync(join(cacheDir, "node_modules"), { recursive: true, force: true }); } catch {}
+          throw new Error("npm install failed — please retry");
+        }
         // Sentinel check: verify install completed (cold cache can timeout leaving partial node_modules)
-        if (!existsSync(join(cacheDir, "node_modules", "vite"))) {
+        if (!existsSync(join(cacheDir, "node_modules", "vite")) || !existsSync(join(cacheDir, "node_modules", "better-sqlite3"))) {
           rmSync(join(cacheDir, "node_modules"), { recursive: true, force: true });
           throw new Error("npm install incomplete — please retry");
         }
@@ -2156,6 +2162,35 @@ server.registerTool(
       });
       steps.push("Build complete.");
 
+      // Pre-check: is port already in use? (prevents orphan zombie processes)
+      try {
+        const { request } = await import("node:http");
+        await new Promise<void>((resolve, reject) => {
+          const req = request(`http://127.0.0.1:${port}/api/overview`, { timeout: 2000 }, (res) => {
+            res.resume();
+            resolve(); // port is responding = already running
+          });
+          req.on("error", () => reject()); // port free
+          req.on("timeout", () => { req.destroy(); reject(); });
+          req.end();
+        });
+        // If we get here, port is already responding
+        steps.push("Dashboard already running.");
+        // Open browser anyway
+        const url = `http://localhost:${port}`;
+        const platform = process.platform;
+        try {
+          if (platform === "darwin") execSync(`open "${url}"`, { stdio: "pipe" });
+          else if (platform === "win32") execSync(`start "" "${url}"`, { stdio: "pipe" });
+          else execSync(`xdg-open "${url}" 2>/dev/null || sensible-browser "${url}" 2>/dev/null`, { stdio: "pipe" });
+        } catch { /* browser open is best-effort */ }
+        return trackResponse("ctx_insight", {
+          content: [{ type: "text" as const, text: `Dashboard already running at http://localhost:${port}` }],
+        });
+      } catch {
+        // Port is free, proceed with spawn
+      }
+
       // Start server in background
       const { spawn } = await import("node:child_process");
       const child = spawn("node", [join(cacheDir, "server.mjs")], {
@@ -2169,6 +2204,7 @@ server.registerTool(
         detached: true,
         stdio: "ignore",
       });
+      child.on("error", () => {}); // prevent unhandled error crash
       child.unref();
 
       // Wait for server to be ready
@@ -2191,7 +2227,7 @@ server.registerTool(
         return trackResponse("ctx_insight", {
           content: [{
             type: "text" as const,
-            text: `Port ${port} appears to be in use. Either a previous dashboard is still running, or another service is using this port.\n\nTo fix:\n- Kill the existing process: lsof -ti:${port} | xargs kill\n- Or use a different port: ctx_insight({ port: 4748 })`,
+            text: `Port ${port} appears to be in use. Either a previous dashboard is still running, or another service is using this port.\n\nTo fix:\n- Kill the existing process: ${process.platform === "win32" ? `netstat -ano | findstr :${port}` : `lsof -ti:${port} | xargs kill`}\n- Or use a different port: ctx_insight({ port: ${port + 1} })`,
           }],
         });
       }
@@ -2210,7 +2246,7 @@ server.registerTool(
       return trackResponse("ctx_insight", {
         content: [{
           type: "text" as const,
-          text: steps.map(s => `- ${s}`).join("\n") + `\n\nOpen: ${url}\nPID: ${child.pid} · Stop: kill ${child.pid}`,
+          text: steps.map(s => `- ${s}`).join("\n") + `\n\nOpen: ${url}\nPID: ${child.pid} · Stop: ${process.platform === "win32" ? `taskkill /PID ${child.pid} /F` : `kill ${child.pid}`}`,
         }],
       });
     } catch (err) {

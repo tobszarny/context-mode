@@ -28,10 +28,21 @@ if (isBun) {
 } else {
   try {
     Database = (await import("better-sqlite3")).default;
-  } catch {
-    console.error("\n  Error: better-sqlite3 not found.");
-    console.error("  Install it: npm install better-sqlite3");
-    console.error("  Or use Bun: bun insight/server.mjs\n");
+    // Verify native addon loads correctly (catches arch mismatch: x86_64 vs arm64)
+    const testDb = new Database(":memory:");
+    testDb.close();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error("\n  Error: better-sqlite3 failed to load.");
+    console.error(`  ${msg}`);
+    if (msg.includes("incompatible architecture") || msg.includes("dlopen")) {
+      const cacheHint = process.env.INSIGHT_SESSION_DIR
+        ? join(dirname(process.env.INSIGHT_SESSION_DIR), "insight-cache", "node_modules")
+        : join("~", ".claude", "context-mode", "insight-cache", "node_modules");
+      console.error(`\n  Fix: rm -rf ${cacheHint} && context-mode insight`);
+    } else {
+      console.error("  Install it: npm install better-sqlite3");
+    }
     process.exit(1);
   }
 }
@@ -100,6 +111,11 @@ function mergeByKey(arr, key, mergeFn) {
     else map.set(k, { ...item });
   }
   return [...map.values()];
+}
+
+// ── Input validation ────────────────────────────────────
+function isValidHash(hash) {
+  return /^[a-f0-9_]+$/.test(hash);
 }
 
 // ── API Handlers ─────────────────────────────────────────
@@ -529,6 +545,7 @@ function route(method, pathname, params) {
 
   if (pathname.startsWith("/api/content/") && pathname.includes("/chunks/")) {
     const parts = pathname.split("/");
+    if (!isValidHash(parts[3])) return { error: "invalid hash" };
     return apiSourceChunks(parts[3], Number(parts[5]));
   }
   if (pathname === "/api/search") {
@@ -538,10 +555,12 @@ function route(method, pathname, params) {
   }
   if (pathname.startsWith("/api/sessions/") && pathname.includes("/events/")) {
     const parts = pathname.split("/");
+    if (!isValidHash(parts[3])) return { error: "invalid hash" };
     return apiSessionEvents(parts[3], decodeURIComponent(parts[5]));
   }
   if (method === "DELETE" && pathname.startsWith("/api/content/")) {
     const parts = pathname.split("/");
+    if (!isValidHash(parts[3])) return { error: "invalid hash" };
     return apiDeleteSource(parts[3], Number(parts[5]));
   }
   return null;
