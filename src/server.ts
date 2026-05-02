@@ -5,7 +5,7 @@ import { createRequire } from "node:module";
 import { createHash } from "node:crypto";
 import { existsSync, unlinkSync, readdirSync, readFileSync, writeFileSync, renameSync, rmSync, mkdirSync, cpSync, statSync, symlinkSync, lstatSync } from "node:fs";
 import { execSync, type ChildProcess } from "node:child_process";
-import { join, dirname, resolve, sep } from "node:path";
+import { join, dirname, resolve, sep, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir, tmpdir, cpus } from "node:os";
 import { request as httpsRequest } from "node:https";
@@ -32,6 +32,7 @@ import { startLifecycleGuard } from "./lifecycle.js";
 import { getWorktreeSuffix, SessionDB } from "./session/db.js";
 import { searchAllSources } from "./search/unified.js";
 import { buildNodeCommand, type HookAdapter } from "./adapters/types.js";
+import { detectPlatform, getSessionDirSegments } from "./adapters/detect.js";
 import { loadDatabase } from "./db-base.js";
 import { AnalyticsEngine, formatReport, getLifetimeStats } from "./session/analytics.js";
 const __pkg_dir = dirname(fileURLToPath(import.meta.url));
@@ -71,7 +72,7 @@ server.server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => 
 
 const executor = new PolyglotExecutor({
   runtimes,
-  projectRoot: process.env.CLAUDE_PROJECT_DIR,
+  projectRoot: () => getProjectDir(),
 });
 
 // ─────────────────────────────────────────────────────────
@@ -129,6 +130,19 @@ let _insightChild: ChildProcess | null = null;
  */
 function getSessionDir(): string {
   if (_detectedAdapter) return _detectedAdapter.getSessionDir();
+  // Pre-detection path (race window before MCP `initialize` completes):
+  // call detectPlatform() (sync, env-var-based) and look up segments via
+  // getSessionDirSegments() (sync map, no adapter instantiation). This keeps
+  // non-Claude platforms from spilling sessions into ~/.claude/.
+  try {
+    const signal = detectPlatform();
+    const segments = getSessionDirSegments(signal.platform);
+    if (segments) {
+      const dir = join(homedir(), ...segments, "context-mode", "sessions");
+      mkdirSync(dir, { recursive: true });
+      return dir;
+    }
+  } catch { /* fall through to .claude fallback */ }
   const dir = join(homedir(), ".claude", "context-mode", "sessions");
   mkdirSync(dir, { recursive: true });
   return dir;
@@ -151,8 +165,18 @@ function getProjectDir(): string {
     || process.env.VSCODE_CWD
     || process.env.OPENCODE_PROJECT_DIR
     || process.env.PI_PROJECT_DIR
+    || process.env.IDEA_INITIAL_DIRECTORY
     || process.env.CONTEXT_MODE_PROJECT_DIR
     || process.cwd();
+}
+
+/**
+ * Resolve a possibly-relative path against the project directory (full env cascade),
+ * not the MCP server's process.cwd(). MCP server is spawned by the host and its cwd
+ * is unrelated to where the user is working.
+ */
+function resolveProjectPath(filePath: string): string {
+  return isAbsolute(filePath) ? filePath : resolve(getProjectDir(), filePath);
 }
 
 /**
@@ -528,7 +552,7 @@ function checkFilePathDenyPolicy(
   toolName: string,
 ): ToolResult | null {
   try {
-    const projectDir = process.env.CLAUDE_PROJECT_DIR ?? process.cwd();
+    const projectDir = getProjectDir();
     const denyGlobs = readToolDenyPatterns("Read", projectDir);
     const result = evaluateFilePath(
       filePath,
@@ -1364,16 +1388,17 @@ server.registerTool(
     }
 
     try {
+      const resolvedPath = path ? resolveProjectPath(path) : undefined;
       // Track the raw bytes being indexed (content or file)
       if (content) trackIndexed(Buffer.byteLength(content));
-      else if (path) {
+      else if (resolvedPath) {
         try {
           const fs = await import("fs");
-          trackIndexed(fs.readFileSync(path).byteLength);
+          trackIndexed(fs.readFileSync(resolvedPath).byteLength);
         } catch { /* ignore — file read errors handled by store */ }
       }
       const store = getStore();
-      const result = store.index({ content, path, source });
+      const result = store.index({ content, path: resolvedPath, source: source ?? resolvedPath });
 
       return trackResponse("ctx_index", {
         content: [
@@ -1552,14 +1577,14 @@ server.registerTool(
       if (sort === "timeline") {
         try {
           const sessionsDir = getSessionDir();
-          const dbFile = join(sessionsDir, `${hashProjectDir()}.db`);
+          const dbFile = join(sessionsDir, `${hashProjectDir()}${getWorktreeSuffix()}.db`);
           if (existsSync(dbFile)) {
             timelineDB = new SessionDB({ dbPath: dbFile });
           }
         } catch { /* SessionDB unavailable — search ContentStore + auto-memory only */ }
       }
 
-      const configDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
+      const configDir = _detectedAdapter?.getConfigDir() ?? (process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"));
 
       try {
       for (const q of queryList) {
@@ -1580,6 +1605,7 @@ server.registerTool(
             sessionDB: timelineDB,
             projectDir: getProjectDir(),
             configDir,
+            adapter: _detectedAdapter ?? undefined,
           });
         } else {
           results = store.searchWithFallback(q, effectiveLimit, source, contentType);

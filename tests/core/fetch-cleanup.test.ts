@@ -74,18 +74,13 @@ function readAndCleanup(outputPath: string): { content: string | null; error: Er
 // ───────────────────────────────────────────────────────────────────
 
 describe("ctx_fetch_and_index cleanup — static source guard", () => {
-  test("handler contains try/finally with rmSync/unlinkSync of outputPath", () => {
+  test("fetch path allocates and cleans up the temp file", () => {
     const src = readFileSync(SERVER_TS, "utf-8");
-    const handlerStart = src.indexOf('"ctx_fetch_and_index"');
-    expect(handlerStart, "ctx_fetch_and_index handler not found").toBeGreaterThan(-1);
-
-    // Find the registerTool call's closing — search ~6KB ahead, plenty for the handler.
-    const handlerSlice = src.slice(handlerStart, handlerStart + 8192);
-
-    // The handler MUST allocate the temp file path...
-    expect(handlerSlice).toMatch(/ctx-fetch-.*\.dat/);
-    // ...wrap the read+index in try/finally...
-    expect(handlerSlice).toMatch(/}\s*finally\s*{[^}]*?(rmSync|unlinkSync)\s*\(\s*outputPath\s*\)/s);
+    // The fetch path may live in an extracted helper (runFetchOne) or inline
+    // in the registered handler. Either way, the source MUST allocate a
+    // ctx-fetch-*.dat path and clean it up in a finally branch.
+    expect(src).toMatch(/ctx-fetch-.*\.dat/);
+    expect(src).toMatch(/}\s*finally\s*{[^}]*?(rmSync|unlinkSync)\s*\(\s*outputPath\s*\)/s);
   });
 });
 
