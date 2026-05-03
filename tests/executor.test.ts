@@ -690,6 +690,29 @@ describe("Timeout Handling", () => {
     assert.equal(r.timedOut, true);
   });
 
+  // Issue #406 — when timeout omitted, no server-side timer fires and a
+  // long-running process completes naturally. Caller (or MCP host) owns
+  // the timeout policy.
+  test("JS: no timeout — short script completes without forced kill", async () => {
+    const r = await executor.execute({
+      language: "javascript",
+      // 250ms wait then print — caller didn't pass timeout, so we must
+      // wait for natural exit, not kill at any heuristic ceiling.
+      code: "setTimeout(() => { console.log('done'); }, 250);",
+    });
+    assert.equal(r.timedOut, false);
+    assert.equal(r.stdout.trim(), "done");
+  });
+
+  test("Shell: no timeout — sleep 1 completes without forced kill", async () => {
+    const r = await executor.execute({
+      language: "shell",
+      code: "sleep 1 && echo done",
+    });
+    assert.equal(r.timedOut, false);
+    assert.equal(r.stdout.trim(), "done");
+  });
+
   test("JS: infinite loop leaves no orphaned process after kill", async () => {
     // Spawn a process that writes its PID then loops forever
     const r = await executor.execute({
