@@ -30,6 +30,11 @@ import {
 import { classifyNonZeroExit } from "./exit-classify.js";
 import { startLifecycleGuard } from "./lifecycle.js";
 import { getWorktreeSuffix, SessionDB } from "./session/db.js";
+import {
+  emitCacheHitEvent,
+  emitIndexWriteEvent,
+  emitSandboxExecuteEvent,
+} from "./session/event-emit.js";
 import { persistToolCallCounter, restoreSessionStats } from "./session/persist-tool-calls.js";
 import { searchAllSources } from "./search/unified.js";
 import { buildNodeCommand, type HookAdapter } from "./adapters/types.js";
@@ -426,12 +431,43 @@ function trackResponse(toolName: string, response: ToolResult): ToolResult {
   // setImmediate keeps this off the response hot path; the helper itself
   // is best-effort (never throws).
   setImmediate(() => persistToolCallCounter(getSessionDbPath(), toolName, bytes));
+
+  // D2 Phase 5/7 — sandbox-execute event emission. Tracks the bytes the
+  // user actually saw from sandboxed runs so getRealBytesStats() can
+  // replace the conservative `events × 256` estimate. Best-effort and
+  // off the hot path, same shape as persistToolCallCounter above.
+  if (
+    toolName === "ctx_execute"
+    || toolName === "ctx_execute_file"
+    || toolName === "ctx_batch_execute"
+  ) {
+    setImmediate(() =>
+      emitSandboxExecuteEvent({
+        sessionDbPath: getSessionDbPath(),
+        toolName,
+        bytesReturned: bytes,
+      })
+    );
+  }
+
   return response;
 }
 
-function trackIndexed(bytes: number): void {
+function trackIndexed(bytes: number, source: string = "unknown"): void {
   sessionStats.bytesIndexed += bytes;
   persistStats();
+  // D2 Phase 5/7 — index-write event emission. `bytes_avoided` because
+  // these are bytes that would have flooded context if the user had
+  // Read'd the source instead of indexing.
+  if (bytes > 0) {
+    setImmediate(() =>
+      emitIndexWriteEvent({
+        sessionDbPath: getSessionDbPath(),
+        source,
+        bytesAvoided: bytes,
+      })
+    );
+  }
 }
 
 // ─────────────────────────────────────────────────────────
@@ -2218,6 +2254,18 @@ server.registerTool(
       if (v.kind === "cached") {
         sessionStats.cacheHits++;
         sessionStats.cacheBytesSaved += v.estimatedBytes;
+        // D2 Phase 5/7 — cache-hit event emission. `bytes_avoided` is the
+        // size of the cached payload that would have re-entered context
+        // had the TTL window missed. Best-effort, off the hot path.
+        const cachedBytes = v.estimatedBytes;
+        const cachedLabel = v.label;
+        setImmediate(() =>
+          emitCacheHitEvent({
+            sessionDbPath: getSessionDbPath(),
+            source: cachedLabel,
+            bytesAvoided: cachedBytes,
+          })
+        );
         finalized.push({ kind: "cached", label: v.label, chunkCount: v.chunkCount, ageStr: v.ageStr });
       } else if (v.kind === "fetch_error") {
         finalized.push({ kind: "fetch_error", url: v.url, error: v.error, reason: v.reason });
