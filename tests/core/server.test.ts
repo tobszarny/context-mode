@@ -3338,6 +3338,55 @@ describe("buildFetchCode — embedded SSRF guard contract", () => {
     expect(generated).toMatch(/dns\[name\]\s*=\s*function/);
   });
 
+  describe("buildFetchCode — redirect chain rebinding", () => {
+    // SSRF rebinding via HTTP redirect chain bypasses the parent's pre-flight
+    // ssrfGuard: a 302 to http://attacker/ (or an IPv4-mapped IMDS literal)
+    // sends the subprocess fetch to an alternate host the parent never
+    // classified. The connect-time DNS guard catches some cases, but a
+    // direct-IP redirect target may not trigger getaddrinfo at all. Mitigate
+    // at the HTTP layer: emit `redirect: 'manual'` in the generated source,
+    // re-validate every Location header against ssrfGuard's classifier, and
+    // cap the redirect chain so an attacker cannot exhaust the loop.
+    const generated = buildFetchCode("https://example.com/x", "/tmp/x");
+
+    test("generated source uses redirect: 'manual' (no follow default)", () => {
+      // The default `redirect: 'follow'` lets undici chase a 3xx Location
+      // BEFORE the in-subprocess DNS guard sees the target hostname (and even
+      // when it does, a direct IPv4-literal redirect skips getaddrinfo). The
+      // generated subprocess source MUST opt out of automatic following so
+      // every hop is re-validated by classifyIp before another fetch fires.
+      expect(generated).toMatch(/redirect:\s*['"]manual['"]/);
+    });
+
+    test("manual redirect handler validates Location host via classifyIp", () => {
+      // After receiving a 3xx, the subprocess must parse the Location header,
+      // resolve its host, and run the same classifyIp policy as ssrfGuard
+      // before issuing the next fetch. Without this re-check, an attacker can
+      // redirect to http://169.254.169.254/ or any rebinding-friendly host.
+      expect(generated).toMatch(/Location/);
+      expect(generated).toMatch(/classifyIp\s*\(/);
+      // The redirect handler specifically must invoke classifyIp on the
+      // redirect target — not just the parent's pre-flight call site.
+      expect(generated).toMatch(/redirect[\s\S]{0,400}classifyIp/);
+    });
+
+    test("redirect chain is capped (no unbounded follow)", () => {
+      // An attacker controlling redirect responses could otherwise loop the
+      // subprocess forever or chain enough hops to amortize a slow rebinding
+      // attack. Cap at 5 — the standard browser limit — and abort cleanly.
+      expect(generated).toMatch(/(maxRedirects|MAX_REDIRECTS|redirectCount\s*[<>]=?\s*5|<\s*5|<=\s*5)/);
+    });
+
+    test("non-3xx response path still emits content (preserves 200 semantics)", () => {
+      // Manual redirect handling must not break the happy path: a 200 OK
+      // still flows through emit() with the right content-type branch. Pin
+      // the existing emit() call sites so a refactor that drops them fails.
+      expect(generated).toMatch(/emit\(['"]json['"]/);
+      expect(generated).toMatch(/emit\(['"]html['"]/);
+      expect(generated).toMatch(/emit\(['"]text['"]/);
+    });
+  });
+
   test("classifyIp embeds without references to module scope", () => {
     // classifyIp is embedded into the subprocess via Function.prototype.toString().
     // If a future change ever has classifyIp close over a module-scope helper

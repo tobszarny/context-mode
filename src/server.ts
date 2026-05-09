@@ -1956,8 +1956,60 @@ function emit(ct, content) {
   console.log('__CM_CT__:' + ct);
 }
 
+// Manual redirect handling: a 3xx Location header can rebind the subprocess
+// fetch to an alternate host the parent's pre-flight ssrfGuard never saw.
+// Even with the connect-time DNS patch, a redirect target that is a literal
+// IP (e.g. http://169.254.169.254/) skips getaddrinfo entirely. Walk the
+// chain manually so every hop runs through classifyIp before the next fetch.
+const MAX_REDIRECTS = 5;
+async function fetchWithManualRedirect(initialUrl) {
+  let currentUrl = initialUrl;
+  for (let redirectCount = 0; redirectCount <= MAX_REDIRECTS; redirectCount++) {
+    const resp = await fetch(currentUrl, { redirect: 'manual' });
+    if (resp.status < 300 || resp.status >= 400) return resp;
+    const location = resp.headers.get('location') || resp.headers.get('Location');
+    if (!location) return resp;
+    if (redirectCount === MAX_REDIRECTS) {
+      throw new Error('SSRF blocked: redirect chain exceeded ' + MAX_REDIRECTS + ' hops');
+    }
+    let nextParsed;
+    try { nextParsed = new URL(location, currentUrl); } catch (e) {
+      throw new Error('SSRF blocked: invalid redirect Location: ' + location);
+    }
+    if (nextParsed.protocol !== 'http:' && nextParsed.protocol !== 'https:') {
+      throw new Error('SSRF blocked: redirect to non-http(s) scheme ' + nextParsed.protocol);
+    }
+    // If the redirect target is a literal IP, classify it directly — no DNS
+    // lookup will fire and the connect-time guard would never see it.
+    const hostname = nextParsed.hostname.replace(/^\[|\]$/g, '');
+    const isIpLiteral = /^[0-9.]+$/.test(hostname) || hostname.includes(':');
+    if (isIpLiteral) {
+      const verdict = classifyIp(hostname);
+      if (verdict === 'block' || (STRICT && verdict === 'private')) {
+        throw new Error('SSRF blocked: redirect to ' + hostname + ' (' + verdict + ')');
+      }
+    } else {
+      // Hostname target: resolve and classify every record. The patched
+      // dns.lookup also fires on the next fetch's connect, but checking
+      // here gives a clearer error and short-circuits before TCP setup.
+      const records = await dnsPromises.lookup(hostname, { all: true, verbatim: true });
+      for (const rec of records) {
+        const verdict = classifyIp(rec.address);
+        if (verdict === 'block' || (STRICT && verdict === 'private')) {
+          throw new Error(
+            'SSRF blocked: redirect target ' + hostname +
+            ' resolves to ' + rec.address + ' (' + verdict + ')'
+          );
+        }
+      }
+    }
+    currentUrl = nextParsed.toString();
+  }
+  throw new Error('SSRF blocked: redirect chain exceeded ' + MAX_REDIRECTS + ' hops');
+}
+
 async function main() {
-  const resp = await fetch(url);
+  const resp = await fetchWithManualRedirect(url);
   if (!resp.ok) { console.error("HTTP " + resp.status); process.exit(1); }
   const contentType = resp.headers.get('content-type') || '';
 
