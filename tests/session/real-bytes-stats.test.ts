@@ -68,7 +68,6 @@ function seed(
           project_dir: "",
           attribution_source: "test",
           attribution_confidence: 1,
-          source_hook: "test",
         },
         "test",
         undefined,
