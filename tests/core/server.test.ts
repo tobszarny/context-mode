@@ -2134,6 +2134,51 @@ describe("ctx_upgrade tool: inline fallback for missing CLI", () => {
     // There should be an else/fallback branch after checking both paths
     expect(serverSrc).toMatch(/existsSync\(fallbackPath\)/);
   });
+
+  // ── #469 follow-up: insight-cache cleanup must route through the shared
+  //    locale-independent helper, not the original inline `for /f`/`findstr`
+  //    block (which was the exact bug PR #469 fixed for ctx_insight). The
+  //    orphan call site at the top of the ctx_upgrade handler still carried
+  //    the broken pattern. Lock that down here.
+  describe("ctx_upgrade insight-cache cleanup uses killProcessOnPort (#469 follow-up)", () => {
+    // Scope assertions to the ctx_upgrade tool registration body so we don't
+    // accidentally match the shared killProcessOnPort helper definition or
+    // its tests below in the same file.
+    const upgradeMatch = serverSrc.match(
+      /server\.registerTool\(\s*"ctx_upgrade"[\s\S]*?^\);/m,
+    );
+    const upgradeBody = upgradeMatch ? upgradeMatch[0] : "";
+
+    test("ctx_upgrade tool block was located in source", () => {
+      expect(upgradeMatch).not.toBeNull();
+    });
+
+    test("ctx_upgrade does NOT contain the broken inline 'for /f' netstat parser", () => {
+      // The locale-broken Windows pattern PR #469 already removed from
+      // killProcessOnPort. Reintroducing it anywhere in ctx_upgrade is a
+      // regression on non-English Windows.
+      expect(upgradeBody).not.toMatch(/for\s+\/f\s+"tokens=5"/);
+      expect(upgradeBody).not.toMatch(/findstr\s+:4747/);
+    });
+
+    test("ctx_upgrade does NOT shell out to taskkill / lsof directly", () => {
+      // All port-cleanup must go through the shared helper. The handler
+      // itself must not hand-roll either Windows or POSIX kill commands.
+      expect(upgradeBody).not.toMatch(/taskkill/);
+      expect(upgradeBody).not.toMatch(/lsof\s+-ti:4747/);
+    });
+
+    test("ctx_upgrade routes insight-cache cleanup through killProcessOnPort(4747)", () => {
+      // Positive assertion: the handler must call the shared helper.
+      expect(upgradeBody).toMatch(/killProcessOnPort\(\s*4747\s*\)/);
+    });
+
+    test("ctx_upgrade preserves best-effort semantics (cleanup wrapped in try/catch)", () => {
+      // Cleanup failure must not block the upgrade — the try/catch at the
+      // top of the handler with the "best effort" comment must remain.
+      expect(upgradeBody).toMatch(/best effort/i);
+    });
+  });
 });
 
 // ─── ctx_purge is the ONLY reset mechanism ──────────────────────────────────

@@ -2833,14 +2833,11 @@ server.registerTool(
       const sessDir = getSessionDir();
       const insightCacheDir = join(dirname(sessDir), "insight-cache");
       if (existsSync(insightCacheDir)) {
-        // Kill any running insight server first
-        try {
-          if (process.platform === "win32") {
-            execSync('for /f "tokens=5" %a in (\'netstat -ano ^| findstr :4747\') do taskkill /F /PID %a', { stdio: "pipe" });
-          } else {
-            execSync("lsof -ti:4747 | xargs kill 2>/dev/null", { stdio: "pipe" });
-          }
-        } catch { /* no process to kill */ }
+        // Kill any running insight server first via the shared helper —
+        // this is locale-independent on Windows (PR #469) and isolates per-pid
+        // failures. We ignore the structured result: cache cleanup is
+        // best-effort and must never block ctx_upgrade.
+        killProcessOnPort(4747);
         rmSync(insightCacheDir, { recursive: true, force: true });
       }
     } catch { /* best effort — don't block upgrade */ }
