@@ -81,7 +81,31 @@ await runHook(async () => {
           additionalContext += "\n\n" + autoInjection;
         }
 
-        // Write session-resume event
+        // D2 PRD Phase 6.2: emit snapshot-consumed with bytes_returned=snapshot.length.
+        // The resumed snapshot bytes ARE returned to the model — that's the whole
+        // point of resume — so account them on bytes_returned, not bytes_avoided.
+        try {
+          const resumeRow = (resume && resume.snapshot)
+            ? resume
+            : (db.getResume?.(sessionId) ?? null);
+          const snapshotBytes = resumeRow?.snapshot?.length ?? 0;
+
+          db.insertEvent(
+            sessionId,
+            {
+              type: "snapshot-consumed",
+              category: "session-resume",
+              data: `Session resumed from ${source}. Snapshot ${snapshotBytes} bytes injected.`,
+              priority: 1,
+            },
+            "SessionStart",
+            undefined,
+            { bytesAvoided: 0, bytesReturned: snapshotBytes },
+          );
+        } catch { /* best-effort */ }
+
+        // Legacy resume_completed event retained for back-compat with existing
+        // analytics consumers that filter on `type === 'resume_completed'`.
         try {
           db.insertEvent(
             sessionId,
