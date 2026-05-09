@@ -1830,16 +1830,124 @@ function resolveGfmPluginPath(): string {
 // Subprocess code that fetches a URL, detects Content-Type, and outputs a
 // __CM_CT__:<type> marker on the first line so the handler can route to the
 // appropriate indexing strategy.  HTML is converted to markdown via Turndown.
-function buildFetchCode(url: string, outputPath: string): string {
+export function buildFetchCode(url: string, outputPath: string): string {
   const turndownPath = JSON.stringify(resolveTurndownPath());
   const gfmPath = JSON.stringify(resolveGfmPluginPath());
   const escapedOutputPath = JSON.stringify(outputPath);
+  // Embed classifyIp into the subprocess so the connect-time DNS lookup is
+  // re-validated with the same policy as ssrfGuard. Without this, an attacker
+  // can serve a public IP for the parent's pre-flight ssrfGuard lookup and
+  // then a blocked IP (e.g. 169.254.169.254 IMDS) for the subprocess fetch's
+  // own lookup — classic DNS rebinding across the parent/child boundary.
+  const classifyIpSrc = classifyIp.toString();
+  const strictMode = process.env.CTX_FETCH_STRICT === "1";
   return `
 const TurndownService = require(${turndownPath});
 const { gfm } = require(${gfmPath});
 const fs = require('fs');
+const dns = require('node:dns');
+const dnsPromises = require('node:dns/promises');
 const url = ${JSON.stringify(url)};
 const outputPath = ${escapedOutputPath};
+
+// Strip proxy env vars from this subprocess only. A configured outbound
+// proxy (HTTP_PROXY / HTTPS_PROXY / ALL_PROXY) would route fetch through
+// an arbitrary target — DNS resolution happens at the proxy and the
+// in-subprocess DNS rebinding guard never sees the rebound IP. The
+// sandbox fetch path has no legitimate need for an upstream proxy.
+delete process.env.HTTP_PROXY;
+delete process.env.HTTPS_PROXY;
+delete process.env.ALL_PROXY;
+delete process.env.http_proxy;
+delete process.env.https_proxy;
+delete process.env.all_proxy;
+delete process.env.npm_config_proxy;
+delete process.env.npm_config_https_proxy;
+
+${classifyIpSrc}
+
+const STRICT = ${JSON.stringify(strictMode)};
+
+// SSRF rebinding defense: every dns.lookup call inside this subprocess
+// (including the one undici performs to connect the fetch socket) is
+// re-validated against the same policy ssrfGuard runs in the parent.
+// Even if a hostname rebinds between the parent's pre-flight check and
+// the subprocess's actual connect, the connect-time lookup re-classifies
+// every returned record and aborts before TCP if any verdict is "block".
+const _origLookup = dns.lookup;
+dns.lookup = function patchedLookup(hostname, options, callback) {
+  if (typeof options === 'function') { callback = options; options = {}; }
+  if (typeof options === 'number') { options = { family: options }; }
+  const wantAll = options && options.all;
+  const opts = Object.assign({}, options || {}, { all: true, verbatim: true });
+  _origLookup(hostname, opts, function(err, records) {
+    if (err) return callback(err);
+    if (!Array.isArray(records)) {
+      records = [{ address: records, family: (options && options.family) || 4 }];
+    }
+    for (var i = 0; i < records.length; i++) {
+      var verdict = classifyIp(records[i].address);
+      if (verdict === 'block' || (STRICT && verdict === 'private')) {
+        return callback(new Error(
+          'SSRF blocked at connect-time: ' + hostname +
+          ' resolves to ' + records[i].address +
+          ' (' + verdict + ')'
+        ));
+      }
+    }
+    if (wantAll) callback(null, records);
+    else callback(null, records[0].address, records[0].family);
+  });
+};
+
+// dns/promises is a separate function reference. Patching dns.lookup does
+// NOT affect dnsPromises.lookup. Today undici's connect path uses callback
+// dns.lookup so default fetch is covered, but the invariant is fragile —
+// any future undici switch (or user code calling dnsPromises.lookup
+// directly) would bypass the guard. Patch both to keep the contract.
+const _origPromisesLookup = dnsPromises.lookup;
+dnsPromises.lookup = async function patchedPromisesLookup(hostname, options) {
+  const opts = Object.assign({}, options || {}, { all: true, verbatim: true });
+  const records = await _origPromisesLookup(hostname, opts);
+  const list = Array.isArray(records) ? records : [records];
+  for (var i = 0; i < list.length; i++) {
+    var verdict = classifyIp(list[i].address);
+    if (verdict === 'block' || (STRICT && verdict === 'private')) {
+      throw new Error(
+        'SSRF blocked at connect-time: ' + hostname +
+        ' resolves to ' + list[i].address + ' (' + verdict + ')'
+      );
+    }
+  }
+  return options && options.all
+    ? list
+    : { address: list[0].address, family: list[0].family };
+};
+
+// dns.resolve4 / dns.resolve6 use a different code path (no getaddrinfo,
+// no /etc/hosts) than dns.lookup — they must be patched separately or the
+// guard is trivially bypassed by any caller using dns.resolve* directly.
+['resolve4', 'resolve6'].forEach(function patchResolve(name) {
+  const _origResolve = dns[name];
+  dns[name] = function patchedResolve(hostname, options, cb) {
+    if (typeof options === 'function') { cb = options; options = undefined; }
+    _origResolve.call(dns, hostname, options || {}, function(err, addrs) {
+      if (err) return cb(err);
+      var withTtl = options && options.ttl;
+      for (var i = 0; i < addrs.length; i++) {
+        var ip = withTtl ? addrs[i].address : addrs[i];
+        var v = classifyIp(ip);
+        if (v === 'block' || (STRICT && v === 'private')) {
+          return cb(new Error(
+            'SSRF blocked at connect-time: ' + hostname +
+            ' resolves to ' + ip + ' (' + v + ')'
+          ));
+        }
+      }
+      cb(null, addrs);
+    });
+  };
+});
 
 function emit(ct, content) {
   // Write content to file to bypass executor stdout truncation (100KB limit).
