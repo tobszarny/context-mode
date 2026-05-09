@@ -51,6 +51,39 @@ function getColumnInfo(dbPath: string, table: string): Map<string, ColInfo> {
   }
 }
 
+/**
+ * Hand-roll a legacy session_events table that omits both bytes columns,
+ * to simulate a DB created by an older context-mode version.
+ */
+function seedLegacyDB(dbPath: string): void {
+  const writer = new Database(dbPath);
+  try {
+    writer.exec(`
+      CREATE TABLE session_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        type TEXT NOT NULL,
+        category TEXT NOT NULL,
+        priority INTEGER NOT NULL DEFAULT 2,
+        data TEXT NOT NULL,
+        project_dir TEXT NOT NULL DEFAULT '',
+        attribution_source TEXT NOT NULL DEFAULT 'unknown',
+        attribution_confidence REAL NOT NULL DEFAULT 0,
+        source_hook TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        data_hash TEXT NOT NULL DEFAULT ''
+      );
+    `);
+    writer.prepare(
+      `INSERT INTO session_events
+         (session_id, type, category, priority, data, source_hook, data_hash)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    ).run("legacy-sess", "file", "file", 2, "/legacy/path.ts", "PostToolUse", "legacyhash");
+  } finally {
+    writer.close();
+  }
+}
+
 describe("SessionDB bytes columns (D2 PRD Phase 1)", () => {
   test("session_events has bytes_avoided NOT NULL DEFAULT 0", () => {
     const { dbPath } = createTestDB();
@@ -68,5 +101,61 @@ describe("SessionDB bytes columns (D2 PRD Phase 1)", () => {
     assert.ok(col, "bytes_returned column must exist");
     assert.equal(col!.notnull, 1, "bytes_returned must be NOT NULL");
     assert.equal(Number(col!.dflt_value), 0, "bytes_returned default must be 0");
+  });
+
+  test("re-opening a migrated DB is idempotent (no duplicate columns or errors)", () => {
+    const dbPath = join(tmpdir(), `session-bytes-idem-${randomUUID()}.db`);
+
+    // First open: cold-create, runs full schema + migration path.
+    const first = new SessionDB({ dbPath });
+    first.cleanup();
+
+    // Second open: hot-attach to the same file. Migration must be a no-op.
+    // If the ALTER TABLE for bytes_avoided/bytes_returned is not guarded
+    // by `cols.has(...)` this throws "duplicate column name".
+    const second = new SessionDB({ dbPath });
+    cleanups.push(() => second.cleanup());
+
+    const cols = getColumnInfo(dbPath, "session_events");
+    // Each column appears exactly once
+    const all = Array.from(cols.values());
+    assert.equal(all.filter((c) => c.name === "bytes_avoided").length, 1);
+    assert.equal(all.filter((c) => c.name === "bytes_returned").length, 1);
+
+    // Second instance must still be functional after no-op migration.
+    second.ensureSession("idem-sess", "/p");
+    second.insertEvent(
+      "idem-sess",
+      { type: "file", category: "file", data: "/idem.ts", priority: 2 },
+      "PostToolUse",
+    );
+    assert.equal(second.getEventCount("idem-sess"), 1);
+  });
+
+  test("legacy DB auto-migrates and existing rows default to 0 for both bytes columns", () => {
+    // Seed an "old format" file first, THEN open with SessionDB so the
+    // migration code path runs against a real legacy schema.
+    const dbPath = join(tmpdir(), `session-bytes-legacy-${randomUUID()}.db`);
+    seedLegacyDB(dbPath);
+
+    const db = new SessionDB({ dbPath });
+    cleanups.push(() => db.cleanup());
+
+    const cols = getColumnInfo(dbPath, "session_events");
+    assert.ok(cols.get("bytes_avoided"), "bytes_avoided must be added by migration");
+    assert.ok(cols.get("bytes_returned"), "bytes_returned must be added by migration");
+
+    // Pre-existing row must read back with 0/0 for the new columns
+    const reader = new Database(dbPath, { readonly: true });
+    try {
+      const row = reader.prepare(
+        `SELECT bytes_avoided, bytes_returned FROM session_events WHERE session_id = ?`,
+      ).get("legacy-sess") as { bytes_avoided: number; bytes_returned: number } | undefined;
+      assert.ok(row, "legacy row must still be readable");
+      assert.equal(row!.bytes_avoided, 0);
+      assert.equal(row!.bytes_returned, 0);
+    } finally {
+      reader.close();
+    }
   });
 });
