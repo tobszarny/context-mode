@@ -16,7 +16,7 @@ import {
 } from "../routing-block.mjs";
 import { createToolNamer } from "./tool-naming.mjs";
 import { isMCPReady } from "./mcp-ready.mjs";
-import { existsSync, mkdirSync, rmSync, rmdirSync, readdirSync, unlinkSync, openSync, closeSync, constants as fsConstants } from "node:fs";
+import { existsSync, mkdirSync, rmSync, rmdirSync, readdirSync, unlinkSync, openSync, closeSync, statSync, constants as fsConstants } from "node:fs";
 
 /**
  * Guard for actions that redirect to MCP tools (#230).
@@ -413,6 +413,15 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
           updatedInput: {
             command: `echo "context-mode: curl/wget blocked. Think in Code — use ${t("ctx_execute")}(language, code) to write code that fetches, processes, and prints only the answer. Or use ${t("ctx_fetch_and_index")}(url, source) to fetch and index. Write pure JS with try/catch, no npm deps. Do NOT retry with curl/wget."`,
           },
+          // D2 PRD Phase 3.1: marker payload for PostToolUse byte accounting.
+          redirectMeta: {
+            tool: "Bash",
+            type: "bash-redirected",
+            // 8192 byte default — typical curl/wget HTTP body the agent would
+            // have spilled into the model's context window had we not blocked.
+            bytesAvoided: 8192,
+            commandSummary: command.slice(0, 200),
+          },
         });
       }
       // All segments safe → allow through
@@ -463,8 +472,29 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
     return guidanceOnce("bash", bashGuidance, sessionId);
   }
 
-  // ─── Read: nudge toward execute_file (once per session) ───
+  // ─── Read: nudge toward execute_file + large-file byte accounting ───
+  // D2 PRD Phase 4 (slices 4.4–4.6): when the file is large enough to flood
+  // context, attach `redirectMeta` so PostToolUse can emit a `read-redirected`
+  // event with the actual file size as bytes_avoided. Threshold = 50 000 bytes;
+  // smaller reads stay on the existing one-shot guidance nudge.
   if (canonical === "Read") {
+    const filePath = toolInput.file_path ?? toolInput.path ?? "";
+    if (filePath) {
+      try {
+        const st = statSync(filePath);
+        if (st.isFile() && st.size > 50_000) {
+          const decision = guidanceOnce("read", readGuidance, sessionId)
+            ?? { action: "context", additionalContext: readGuidance };
+          decision.redirectMeta = {
+            tool: "Read",
+            type: "read-redirected",
+            bytesAvoided: st.size,
+            commandSummary: String(filePath).slice(0, 200),
+          };
+          return decision;
+        }
+      } catch { /* file missing or unreadable — fall through to plain guidance */ }
+    }
     return guidanceOnce("read", readGuidance, sessionId);
   }
 
@@ -479,6 +509,15 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
     return mcpRedirect({
       action: "deny",
       reason: `context-mode: WebFetch blocked. Think in Code — use ${t("ctx_fetch_and_index")}(url: "${url}", source: "...") to fetch and index, then ${t("ctx_search")}(queries: [...]) to query. Or use ${t("ctx_execute")}(language, code) to fetch, process, and console.log() only what you need. Write pure JS, no npm deps. Do NOT use curl, wget, or WebFetch.`,
+      // D2 PRD Phase 4.1: marker payload for PostToolUse byte accounting.
+      redirectMeta: {
+        tool: "WebFetch",
+        type: "webfetch-redirected",
+        // 16384 = typical web page body bytes prevented from entering the
+        // model's context window.
+        bytesAvoided: 16384,
+        commandSummary: String(url).slice(0, 200),
+      },
     });
   }
 
