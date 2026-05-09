@@ -109,9 +109,19 @@ export interface StoredEvent {
   project_dir: string;
   attribution_source: string;
   attribution_confidence: number;
+  bytes_avoided: number;
+  bytes_returned: number;
   source_hook: string;
   created_at: string;
   data_hash: string;
+}
+
+/** Optional per-event byte accounting passed to {@link SessionDB.insertEvent}. */
+export interface EventBytes {
+  /** Bytes context-mode prevented from entering the model context window. */
+  bytesAvoided?: number;
+  /** Bytes context-mode actually returned to the model. */
+  bytesReturned?: number;
 }
 
 /** Session metadata row from the session_meta table. */
@@ -148,6 +158,18 @@ const MAX_EVENTS_PER_SESSION = 1000;
 /** Number of recent events to check for deduplication. */
 const DEDUP_WINDOW = 5;
 
+/**
+ * Coerce an arbitrary input to a non-negative integer suitable for
+ * SQLite's INTEGER column. Accepts undefined / null / NaN / floats
+ * and returns 0 for invalid inputs so the column never violates its
+ * NOT NULL DEFAULT 0 contract.
+ */
+function clampNonNegativeInt(value: unknown): number {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.floor(n);
+}
+
 // ─────────────────────────────────────────────────────────
 // Statement keys (typed enum to avoid string typos)
 // ─────────────────────────────────────────────────────────
@@ -178,6 +200,7 @@ const S = {
   incrementToolCall: "incrementToolCall",
   getToolCallTotals: "getToolCallTotals",
   getToolCallByTool: "getToolCallByTool",
+  getEventBytesSummary: "getEventBytesSummary",
 } as const;
 
 // ─────────────────────────────────────────────────────────
@@ -311,31 +334,36 @@ export class SessionDB extends SQLiteBase {
       `INSERT INTO session_events (
          session_id, type, category, priority, data,
          project_dir, attribution_source, attribution_confidence,
+         bytes_avoided, bytes_returned,
          source_hook, data_hash
        )
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
 
     p(S.getEvents,
       `SELECT id, session_id, type, category, priority, data,
               project_dir, attribution_source, attribution_confidence,
+              bytes_avoided, bytes_returned,
               source_hook, created_at, data_hash
        FROM session_events WHERE session_id = ? ORDER BY id ASC LIMIT ?`);
 
     p(S.getEventsByType,
       `SELECT id, session_id, type, category, priority, data,
               project_dir, attribution_source, attribution_confidence,
+              bytes_avoided, bytes_returned,
               source_hook, created_at, data_hash
        FROM session_events WHERE session_id = ? AND type = ? ORDER BY id ASC LIMIT ?`);
 
     p(S.getEventsByPriority,
       `SELECT id, session_id, type, category, priority, data,
               project_dir, attribution_source, attribution_confidence,
+              bytes_avoided, bytes_returned,
               source_hook, created_at, data_hash
        FROM session_events WHERE session_id = ? AND priority >= ? ORDER BY id ASC LIMIT ?`);
 
     p(S.getEventsByTypeAndPriority,
       `SELECT id, session_id, type, category, priority, data,
               project_dir, attribution_source, attribution_confidence,
+              bytes_avoided, bytes_returned,
               source_hook, created_at, data_hash
        FROM session_events WHERE session_id = ? AND type = ? AND priority >= ? ORDER BY id ASC LIMIT ?`);
 
@@ -452,6 +480,12 @@ export class SessionDB extends SQLiteBase {
     p(S.getToolCallByTool,
       `SELECT tool, calls, bytes_returned
        FROM tool_calls WHERE session_id = ? ORDER BY calls DESC`);
+
+    // ── Event-level byte accounting (D2 PRD Phase 2) ──
+    p(S.getEventBytesSummary,
+      `SELECT COALESCE(SUM(bytes_avoided), 0) AS bytes_avoided,
+              COALESCE(SUM(bytes_returned), 0) AS bytes_returned
+       FROM session_events WHERE session_id = ?`);
   }
 
   // ═══════════════════════════════════════════
@@ -472,6 +506,7 @@ export class SessionDB extends SQLiteBase {
     event: Omit<SessionEvent, "data_hash"> & { data_hash?: string },
     sourceHook: string = "PostToolUse",
     attribution?: Partial<ProjectAttribution>,
+    bytes?: EventBytes,
   ): void {
     // SHA256-based dedup hash (first 16 hex chars = 8 bytes of entropy)
     const dataHash = createHash("sha256")
@@ -497,6 +532,8 @@ export class SessionDB extends SQLiteBase {
     const attributionConfidence = Number.isFinite(rawConfidence)
       ? Math.max(0, Math.min(1, rawConfidence))
       : 0;
+    const bytesAvoided = clampNonNegativeInt(bytes?.bytesAvoided);
+    const bytesReturned = clampNonNegativeInt(bytes?.bytesReturned);
 
     // Atomic: dedup check + eviction + insert in a single transaction
     // to prevent race conditions from concurrent hook calls.
@@ -521,6 +558,8 @@ export class SessionDB extends SQLiteBase {
         projectDir,
         attributionSource,
         attributionConfidence,
+        bytesAvoided,
+        bytesReturned,
         sourceHook,
         dataHash,
       );
@@ -548,11 +587,12 @@ export class SessionDB extends SQLiteBase {
     events: SessionEvent[],
     sourceHook: string = "PostToolUse",
     attributions?: Array<Partial<ProjectAttribution> | undefined>,
+    bytesList?: Array<EventBytes | undefined>,
   ): void {
     if (!events || events.length === 0) return;
     if (events.length === 1) {
       // Cheaper to fall through to insertEvent (its own dedicated transaction).
-      this.insertEvent(sessionId, events[0], sourceHook, attributions?.[0]);
+      this.insertEvent(sessionId, events[0], sourceHook, attributions?.[0], bytesList?.[0]);
       return;
     }
 
@@ -577,7 +617,18 @@ export class SessionDB extends SQLiteBase {
       const attributionConfidence = Number.isFinite(rawConfidence)
         ? Math.max(0, Math.min(1, rawConfidence))
         : 0;
-      return { event, dataHash, projectDir, attributionSource, attributionConfidence };
+      const eventBytes = bytesList?.[i];
+      const bytesAvoided = clampNonNegativeInt(eventBytes?.bytesAvoided);
+      const bytesReturned = clampNonNegativeInt(eventBytes?.bytesReturned);
+      return {
+        event,
+        dataHash,
+        projectDir,
+        attributionSource,
+        attributionConfidence,
+        bytesAvoided,
+        bytesReturned,
+      };
     });
 
     const transaction = this.db.transaction(() => {
@@ -601,6 +652,8 @@ export class SessionDB extends SQLiteBase {
           row.projectDir,
           row.attributionSource,
           row.attributionConfidence,
+          row.bytesAvoided,
+          row.bytesReturned,
           sourceHook,
           row.dataHash,
         );
@@ -640,6 +693,26 @@ export class SessionDB extends SQLiteBase {
   getEventCount(sessionId: string): number {
     const row = this.stmt(S.getEventCount).get(sessionId) as { cnt: number };
     return row.cnt;
+  }
+
+  /**
+   * Aggregate per-event byte accounting for a session.
+   *
+   * Returns the total bytes context-mode kept OUT of the model context
+   * window (`bytesAvoided`) and the total it actually returned to the
+   * model (`bytesReturned`). Both default to 0 for unknown sessions.
+   *
+   * Used by the Insight dashboard to render the "saved vs returned"
+   * panel without scanning every event row in JS.
+   */
+  getEventBytesSummary(sessionId: string): { bytesAvoided: number; bytesReturned: number } {
+    const row = this.stmt(S.getEventBytesSummary).get(sessionId) as
+      | { bytes_avoided: number | null; bytes_returned: number | null }
+      | undefined;
+    return {
+      bytesAvoided: Number(row?.bytes_avoided ?? 0),
+      bytesReturned: Number(row?.bytes_returned ?? 0),
+    };
   }
 
   /**
