@@ -187,11 +187,27 @@ function isSyntheticMessage(text: string): boolean {
 
 // ── Helpers ───────────────────────────────────────────────
 
-const ROUTING_MARKERS = ["ctx_execute", "ctx_batch_execute", "ctx_fetch_and_index"];
+// Quorum markers — must NOT be substrings of each other (#487).
+// Each token uniquely identifies the routing block / context-mode rules
+// without overlapping any other marker. The XML tag is the primary signal;
+// the two distinctive bare tool names are the secondary signals. Together
+// any 2 of 3 confirm the system prompt already carries routing instructions.
+const ROUTING_MARKERS = [
+  "<context_window_protection>",
+  "ctx_search",
+  "ctx_index",
+];
 
 function systemHasRoutingInstructions(system: string[]): boolean {
   const text = system.join("\n");
-  return ROUTING_MARKERS.filter((m) => text.includes(m)).length >= 2;
+  // Word-boundary check guards against unrelated identifiers that happen to
+  // share a prefix/suffix (e.g. a hypothetical `ctx_search_v2`).
+  const wordBoundary = (m: string) => {
+    if (m.startsWith("<")) return text.includes(m);
+    const re = new RegExp(`(?:^|\\W)${m.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\$&")}(?:\\W|$)`);
+    return re.test(text);
+  };
+  return ROUTING_MARKERS.filter(wordBoundary).length >= 2;
 }
 
 /**
@@ -516,3 +532,5 @@ async function createContextModePlugin(ctx: PluginContext) {
 // OpenCode compat: named export for direct import("context-mode/plugin")
 export default { id:"context-mode", server: createContextModePlugin };
 export { createContextModePlugin as ContextModePlugin };
+// Test surface — exported for unit testing the quorum substring fix (#487).
+export { systemHasRoutingInstructions, ROUTING_MARKERS };

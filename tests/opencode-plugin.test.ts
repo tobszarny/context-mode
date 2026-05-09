@@ -622,29 +622,35 @@ describe("ContextModePlugin", () => {
 
     it("OC-1: skips routing block when system prompt already contains context-mode instructions", async () => {
       const plugin = await createTestPlugin(join(tempDir, "oc1-dedup"));
-      // Simulate AGENTS.md already loaded by the host — contains routing markers
+      // Simulate AGENTS.md already loaded by the host — contains routing markers.
+      // Post-#487: markers are <context_window_protection>, ctx_search, ctx_index
+      // (non-overlapping). Quorum requires 2-of-3 distinct.
       const agentsContent = [
         "# context-mode rules",
-        "Use ctx_execute for analysis",
-        "Use ctx_batch_execute for commands",
-        "Use ctx_fetch_and_index for URLs",
+        "<context_window_protection> applies to this project.",
+        "Use ctx_search for memory recall.",
+        "Use ctx_index to store new content.",
       ].join("\n");
       const out = { system: ["HEADER", agentsContent] };
       await plugin["experimental.chat.system.transform"](
         { sessionID: "oc1-dedup-sess", model: {} } as any,
         out,
       );
-      // system unchanged — no routing block injected (2+ markers detected)
+      // system unchanged — no routing block injected (2+ markers detected).
+      // Length stays 2 (HEADER + the existing AGENTS.md entry); the fixture
+      // itself contains <context_window_protection>, so we assert by structure
+      // (no new entry spliced in) rather than substring absence.
       expect(out.system.length).toBe(2);
       expect(out.system[0]).toBe("HEADER");
       expect(out.system[1]).toBe(agentsContent);
-      expect(out.system.join("\n")).not.toContain("<context_window_protection>");
     });
 
     it("OC-1: injects routing block when only one marker present (below quorum)", async () => {
       const plugin = await createTestPlugin(join(tempDir, "oc1-below-quorum"));
-      // Only one marker — below the 2-of-3 quorum — routing block still injects
-      const partialContent = "Some text mentioning ctx_execute but nothing else";
+      // Only one marker — below the 2-of-3 quorum — routing block still injects.
+      // Post-#487: the active markers are <context_window_protection>, ctx_search,
+      // ctx_index. Use exactly one to assert below-quorum behavior.
+      const partialContent = "Some text mentioning ctx_search but nothing else";
       const out = { system: ["HEADER", partialContent] };
       await plugin["experimental.chat.system.transform"](
         { sessionID: "oc1-quorum-sess", model: {} } as any,
@@ -652,6 +658,35 @@ describe("ContextModePlugin", () => {
       );
       expect(out.system.length).toBe(3); // HEADER + routing + partialContent
       expect(out.system[1]).toContain("<context_window_protection>");
+    });
+  });
+
+  // ── OC-1 quorum substring overlap (#487) ────────────────
+  // RED proof: the marker set ["ctx_execute", "ctx_batch_execute", ...] uses
+  // overlapping substrings. `text.includes("ctx_execute")` matches ALSO on any
+  // `ctx_batch_execute` occurrence, so a SINGLE user paste mentioning
+  // ctx_batch_execute satisfies the 2-of-3 quorum and suppresses the routing
+  // block for the entire session. The fix replaces the markers with
+  // non-overlapping tokens (or word-boundary regex) while preserving the
+  // ≥2 distinct markers semantic.
+  describe("OC-1 quorum: single marker substring overlap", () => {
+    it("returns false for text mentioning ctx_batch_execute exactly once", async () => {
+      const { systemHasRoutingInstructions } = await import("../src/adapters/opencode/plugin.js");
+      const text = "what does ctx_batch_execute do?";
+      // 1 distinct marker → below quorum → false
+      expect(systemHasRoutingInstructions([text])).toBe(false);
+    });
+
+    it("returns true when two distinct (non-overlapping) markers are present", async () => {
+      const { systemHasRoutingInstructions } = await import("../src/adapters/opencode/plugin.js");
+      const text = "ctx_search and ctx_index help";
+      expect(systemHasRoutingInstructions([text])).toBe(true);
+    });
+
+    it("returns true when the routing-block XML tag is present alongside one tool", async () => {
+      const { systemHasRoutingInstructions } = await import("../src/adapters/opencode/plugin.js");
+      const text = "<context_window_protection> applies. use ctx_search.";
+      expect(systemHasRoutingInstructions([text])).toBe(true);
     });
   });
 
