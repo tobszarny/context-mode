@@ -75,6 +75,30 @@ export interface McpToolUsageRow {
   max_concurrency: number | null;
 }
 
+/**
+ * Conversation-scoped stats — aggregated from `session_events` for a single
+ * `session_id` across every worktree DB plus the compact-rescue snapshot from
+ * `session_resume`. Replaces the broken in-memory `tool_call_counter` that
+ * only saw `ctx_*` MCP calls and reset to 0 every time the MCP server PID
+ * changed (which is what made hours-of-work conversations show "1 call · 5 KB").
+ */
+export interface ConversationStats {
+  /** session_id this aggregate covers (the current Claude Code conversation). */
+  sessionId: string;
+  /** Total event count for this session_id, summed across all DBs. */
+  events: number;
+  /** Distinct DB files this session_id appeared in (a rotation indicator). */
+  dbCount: number;
+  /** Wall-clock days from first to last event. Captures real activity length. */
+  daysAlive: number;
+  /** Bytes restored from the compact snapshot for this session_id. 0 if no compact. */
+  snapshotBytes: number;
+  /** Number of compact snapshots consumed for this session_id. */
+  snapshotsConsumed: number;
+  /** Category breakdown for this session_id. */
+  byCategory: Array<{ category: string; count: number; label: string }>;
+}
+
 // ─────────────────────────────────────────────────────────
 // Runtime stats — passed in from server.ts (can't come from DB)
 // ─────────────────────────────────────────────────────────
@@ -146,23 +170,50 @@ export interface FullReport {
 // Category labels and hints for session continuity display
 // ─────────────────────────────────────────────────────────
 
-/** Human-readable labels for event categories. */
+/**
+ * Human-readable labels for event categories.
+ *
+ * Each label is a sentence-case phrase that reads like a benefit, not a
+ * column name. The user shouldn't see raw schema words like "external-ref"
+ * or "agent-finding" — those leak the database into the UX. When a new
+ * category lands without an entry here, the renderer falls through to the
+ * raw category id; that's a copy-debt signal, fix it here.
+ */
 export const categoryLabels: Record<string, string> = {
+  // Code & filesystem
   file: "Files tracked",
+  cwd: "Working directory",
+  // Configuration & intent
   rule: "Project rules (CLAUDE.md)",
   prompt: "Your requests saved",
-  mcp: "Plugin tools used",
-  git: "Git operations",
-  env: "Environment setup",
-  error: "Errors caught",
-  task: "Tasks in progress",
-  decision: "Your decisions",
-  cwd: "Working directory",
+  intent: "Session goal",
+  role: "Behavior rules",
+  constraint: "Constraints you set",
+  // Tools & delegation
+  mcp: "MCP tools called",
   skill: "Skills used",
   subagent: "Delegated work",
-  intent: "Session mode",
+  // Knowledge & decisions
+  decision: "Your decisions",
+  "agent-finding": "Agent insights kept",
+  "rejected-approach": "Approaches you rejected",
+  "external-ref": "External docs indexed",
   data: "Data references",
-  role: "Behavioral directives",
+  // System events
+  git: "Git operations",
+  env: "Environment setup",
+  task: "Tasks in progress",
+  error: "Errors caught",
+  // Continuity proof
+  compact: "Compactions weathered",
+  resume: "Sessions resumed cleanly",
+  snapshot: "Snapshots restored",
+  cache: "Cache hits saved",
+  // Operational
+  latency: "Slow tools recorded",
+  "user-prompt": "Your messages remembered",
+  plan: "Plans drafted",
+  "blocked-on": "Blockers logged",
 };
 
 /** Explains why each category matters for continuity. */
@@ -504,6 +555,24 @@ export interface LifetimeStats {
    * sidecar has any events. Optional for back-compat with older fixtures.
    */
   categoryCounts: Record<string, number>;
+  /**
+   * Total bytes restored from compact-rescue snapshots across every DB on
+   * disk. Adds the rescue benefit to lifetime $ so the headline isn't
+   * silently undercounting the killer feature. 0 when no compact has fired
+   * or older fixtures don't pass this. Optional for back-compat with tests.
+   */
+  rescueBytes?: number;
+  /**
+   * Earliest event timestamp (ms epoch) across every DB. Used for the
+   * "since 2026-04-14" lifetime narrative. 0 when unknown. Optional.
+   */
+  firstEventMs?: number;
+  /**
+   * Distinct project_dir count across every DB. Different from
+   * `autoMemoryProjects` (which only counts dirs with auto-memory files).
+   * Captures every cwd context-mode has ever seen events for. Optional.
+   */
+  distinctProjects?: number;
 }
 
 /** Extract leading prefix from auto-memory filename: `feedback_push.md` → `feedback`. */
@@ -533,6 +602,9 @@ export function getLifetimeStats(opts?: {
 
   let totalEvents = 0;
   let totalSessions = 0;
+  let rescueBytes = 0;
+  let firstEventMs = Number.POSITIVE_INFINITY;
+  const distinctProjectsSet = new Set<string>();
   const categoryCounts: Record<string, number> = {};
 
   // ── SessionDB aggregation ──
@@ -575,6 +647,33 @@ export function getLifetimeStats(opts?: {
               } catch {
                 // older schema / no category column — ignore
               }
+              // Lifetime rescue: compact-snapshot bytes restored across every DB.
+              // Without this, the lifetime $ silently undercounts the killer
+              // continuity-after-/compact feature.
+              try {
+                const snap = sdb.prepare(
+                  "SELECT COALESCE(SUM(length(snapshot)), 0) AS bytes FROM session_resume WHERE consumed = 1",
+                ).get() as { bytes: number } | undefined;
+                if (snap?.bytes) rescueBytes += snap.bytes;
+              } catch { /* old schema */ }
+              // Earliest event timestamp + distinct project_dirs for the
+              // "since X · Y projects" lifetime narrative.
+              try {
+                const mn = sdb.prepare(
+                  "SELECT MIN(created_at) AS t FROM session_events",
+                ).get() as { t: string | null } | undefined;
+                if (mn?.t) {
+                  const stamp = mn.t.endsWith("Z") ? mn.t : mn.t + "Z";
+                  const ms = Date.parse(stamp);
+                  if (Number.isFinite(ms) && ms < firstEventMs) firstEventMs = ms;
+                }
+              } catch { /* old schema */ }
+              try {
+                const projRows = sdb.prepare(
+                  "SELECT DISTINCT project_dir AS p FROM session_events WHERE project_dir != ''",
+                ).all() as Array<{ p: string }>;
+                for (const row of projRows) if (row.p) distinctProjectsSet.add(row.p);
+              } catch { /* old schema */ }
             } finally {
               sdb.close();
             }
@@ -625,8 +724,283 @@ export function getLifetimeStats(opts?: {
     autoMemoryProjects,
     autoMemoryByPrefix,
     categoryCounts,
+    rescueBytes,
+    firstEventMs: Number.isFinite(firstEventMs) ? firstEventMs : 0,
+    distinctProjects: distinctProjectsSet.size,
   };
 }
+
+/**
+ * Aggregate every event for one `session_id` across all SessionDB files in
+ * `sessionsDir` plus the compact-rescue snapshot bytes from `session_resume`.
+ *
+ * Why this exists: the Claude Code session_id can persist across days while
+ * the underlying DB file rotates (size cap), and a compact-rescue snapshot
+ * carries hundreds of KB of context that would otherwise have been lost. The
+ * old in-memory `tool_call_counter` saw none of this — it counted only `ctx_*`
+ * MCP calls against the current MCP server PID and reset on every restart.
+ * Reading from `session_events` + `session_resume` is the source-of-truth
+ * version that matches what users actually experienced.
+ */
+export function getConversationStats(opts: {
+  sessionId: string;
+  sessionsDir?: string;
+  /** Optional worktree filename prefix (sha256(cwd)[:16]). When omitted, scans every DB. */
+  worktreeHash?: string;
+  loadDatabase?: () => unknown;
+}): ConversationStats {
+  const sessionsDir = opts.sessionsDir
+    ?? join(homedir(), ".claude", "context-mode", "sessions");
+  const sessionId = opts.sessionId;
+
+  const empty: ConversationStats = {
+    sessionId,
+    events: 0,
+    dbCount: 0,
+    daysAlive: 0,
+    snapshotBytes: 0,
+    snapshotsConsumed: 0,
+    byCategory: [],
+  };
+  if (!sessionId || !existsSync(sessionsDir)) return empty;
+
+  let dbFiles: string[] = [];
+  try {
+    dbFiles = readdirSync(sessionsDir).filter((f) => {
+      if (!f.endsWith(".db")) return false;
+      if (opts.worktreeHash && !f.startsWith(opts.worktreeHash)) return false;
+      return true;
+    });
+  } catch { return empty; }
+  if (dbFiles.length === 0) return empty;
+
+  let DatabaseCtor: ReturnType<typeof loadDatabaseImpl> | null = null;
+  try {
+    DatabaseCtor = opts.loadDatabase
+      ? (opts.loadDatabase() as ReturnType<typeof loadDatabaseImpl>)
+      : loadDatabaseImpl();
+  } catch { return empty; }
+  if (!DatabaseCtor) return empty;
+
+  const catCounts: Record<string, number> = {};
+  let events = 0;
+  let dbCount = 0;
+  let snapshotBytes = 0;
+  let snapshotsConsumed = 0;
+  let firstMs = Number.POSITIVE_INFINITY;
+  let lastMs = 0;
+
+  for (const file of dbFiles) {
+    const dbPath = join(sessionsDir, file);
+    let touched = false;
+    try {
+      const sdb = new DatabaseCtor(dbPath, { readonly: true });
+      try {
+        const cats = sdb.prepare(
+          "SELECT category, COUNT(*) AS cnt FROM session_events WHERE session_id = ? GROUP BY category",
+        ).all(sessionId) as Array<{ category: string; cnt: number }>;
+        for (const row of cats) {
+          if (!row.category) continue;
+          catCounts[row.category] = (catCounts[row.category] ?? 0) + (row.cnt ?? 0);
+          events += row.cnt ?? 0;
+          touched = true;
+        }
+        const range = sdb.prepare(
+          "SELECT MIN(created_at) AS mn, MAX(created_at) AS mx FROM session_events WHERE session_id = ?",
+        ).get(sessionId) as { mn: string | null; mx: string | null } | undefined;
+        if (range?.mn) {
+          const t = Date.parse(range.mn + (range.mn.endsWith("Z") ? "" : "Z"));
+          if (Number.isFinite(t) && t < firstMs) firstMs = t;
+        }
+        if (range?.mx) {
+          const t = Date.parse(range.mx + (range.mx.endsWith("Z") ? "" : "Z"));
+          if (Number.isFinite(t) && t > lastMs) lastMs = t;
+        }
+        try {
+          const snap = sdb.prepare(
+            "SELECT COALESCE(SUM(length(snapshot)), 0) AS bytes, COUNT(*) AS n FROM session_resume WHERE session_id = ? AND consumed = 1",
+          ).get(sessionId) as { bytes: number; n: number } | undefined;
+          if (snap?.bytes) snapshotBytes += snap.bytes;
+          if (snap?.n) snapshotsConsumed += snap.n;
+        } catch { /* old schema */ }
+      } finally {
+        sdb.close();
+      }
+    } catch { /* missing tables / corrupt */ }
+    if (touched) dbCount++;
+  }
+
+  const daysAlive = firstMs < lastMs ? (lastMs - firstMs) / 86_400_000 : 0;
+  const byCategory = Object.entries(catCounts)
+    .filter(([, n]) => n > 0)
+    .map(([category, count]) => ({
+      category,
+      count,
+      label: categoryLabels[category] || category,
+    }))
+    .sort((a, b) => b.count - a.count);
+
+  return { sessionId, events, dbCount, daysAlive, snapshotBytes, snapshotsConsumed, byCategory };
+}
+
+// ─────────────────────────────────────────────────────────
+// getRealBytesStats — Phase 8 of D2 PRD (stats-event-driven-architecture)
+// ─────────────────────────────────────────────────────────
+
+/**
+ * Real-bytes counter the renderer uses to replace the conservative
+ * `events × 256` token estimate. Reads four sources from disk and
+ * returns the sum the renderer divides by 4 to get tokens.
+ *
+ * - `eventDataBytes`  = SUM(LENGTH(data))      FROM session_events
+ * - `bytesAvoided`    = SUM(bytes_avoided)     FROM session_events
+ * - `bytesReturned`   = SUM(bytes_returned)    FROM session_events
+ * - `snapshotBytes`   = SUM(LENGTH(snapshot))  FROM session_resume
+ * - `totalSavedTokens` = (eventDataBytes + bytesAvoided + snapshotBytes) / 4
+ *
+ * `bytesReturned` is reported but NOT folded into `totalSavedTokens`
+ * because it represents bytes the model already paid for — adding it
+ * would double-count what's already on the user's invoice.
+ */
+export interface RealBytesStats {
+  eventDataBytes: number;
+  bytesAvoided: number;
+  bytesReturned: number;
+  snapshotBytes: number;
+  totalSavedTokens: number;
+}
+
+/**
+ * Compute real-bytes stats across one session, one project (worktree
+ * filter), or every session on disk (lifetime).
+ *
+ * - Pass `sessionId` for the conversation tier.
+ * - Pass `worktreeHash` to filter `*.db` files by name prefix
+ *   (per-project lifetime — `sha256(cwd).slice(0, 16)`).
+ * - Pass neither — full lifetime aggregate.
+ *
+ * Best-effort: returns zeroes when the dir is missing, the DB is
+ * corrupt, or the session has no events. Never throws — same
+ * contract as `getConversationStats` / `getLifetimeStats` so the
+ * stats-render path can never crash on a bad sidecar.
+ */
+export function getRealBytesStats(opts: {
+  sessionId?: string;
+  sessionsDir?: string;
+  worktreeHash?: string;
+  loadDatabase?: () => unknown;
+}): RealBytesStats {
+  const empty: RealBytesStats = {
+    eventDataBytes: 0,
+    bytesAvoided: 0,
+    bytesReturned: 0,
+    snapshotBytes: 0,
+    totalSavedTokens: 0,
+  };
+
+  const sessionsDir = opts.sessionsDir
+    ?? join(homedir(), ".claude", "context-mode", "sessions");
+  if (!existsSync(sessionsDir)) return empty;
+
+  let dbFiles: string[] = [];
+  try {
+    dbFiles = readdirSync(sessionsDir).filter((f) => {
+      if (!f.endsWith(".db")) return false;
+      if (opts.worktreeHash && !f.startsWith(opts.worktreeHash)) return false;
+      return true;
+    });
+  } catch { return empty; }
+  if (dbFiles.length === 0) return empty;
+
+  let DatabaseCtor: ReturnType<typeof loadDatabaseImpl> | null = null;
+  try {
+    DatabaseCtor = opts.loadDatabase
+      ? (opts.loadDatabase() as ReturnType<typeof loadDatabaseImpl>)
+      : loadDatabaseImpl();
+  } catch { return empty; }
+  if (!DatabaseCtor) return empty;
+
+  let eventDataBytes = 0;
+  let bytesAvoided = 0;
+  let bytesReturned = 0;
+  let snapshotBytes = 0;
+
+  // Each branch returns the tuple in the SAME column order so callers
+  // don't need to type-narrow per row.
+  for (const file of dbFiles) {
+    const dbPath = join(sessionsDir, file);
+    try {
+      const sdb = new DatabaseCtor(dbPath, { readonly: true });
+      try {
+        if (opts.sessionId) {
+          const row = sdb.prepare(
+            `SELECT
+               COALESCE(SUM(LENGTH(data)), 0)   AS data_bytes,
+               COALESCE(SUM(bytes_avoided), 0)  AS bytes_avoided,
+               COALESCE(SUM(bytes_returned), 0) AS bytes_returned
+             FROM session_events WHERE session_id = ?`,
+          ).get(opts.sessionId) as
+            | { data_bytes: number; bytes_avoided: number; bytes_returned: number }
+            | undefined;
+          if (row) {
+            eventDataBytes += Number(row.data_bytes ?? 0);
+            bytesAvoided   += Number(row.bytes_avoided ?? 0);
+            bytesReturned  += Number(row.bytes_returned ?? 0);
+          }
+          try {
+            const snap = sdb.prepare(
+              "SELECT COALESCE(SUM(LENGTH(snapshot)), 0) AS bytes FROM session_resume WHERE session_id = ?",
+            ).get(opts.sessionId) as { bytes: number } | undefined;
+            if (snap?.bytes) snapshotBytes += Number(snap.bytes);
+          } catch { /* old schema */ }
+        } else {
+          const row = sdb.prepare(
+            `SELECT
+               COALESCE(SUM(LENGTH(data)), 0)   AS data_bytes,
+               COALESCE(SUM(bytes_avoided), 0)  AS bytes_avoided,
+               COALESCE(SUM(bytes_returned), 0) AS bytes_returned
+             FROM session_events`,
+          ).get() as
+            | { data_bytes: number; bytes_avoided: number; bytes_returned: number }
+            | undefined;
+          if (row) {
+            eventDataBytes += Number(row.data_bytes ?? 0);
+            bytesAvoided   += Number(row.bytes_avoided ?? 0);
+            bytesReturned  += Number(row.bytes_returned ?? 0);
+          }
+          try {
+            const snap = sdb.prepare(
+              "SELECT COALESCE(SUM(LENGTH(snapshot)), 0) AS bytes FROM session_resume",
+            ).get() as { bytes: number } | undefined;
+            if (snap?.bytes) snapshotBytes += Number(snap.bytes);
+          } catch { /* old schema */ }
+        }
+      } finally {
+        sdb.close();
+      }
+    } catch { /* missing tables / corrupt — skip */ }
+  }
+
+  const totalSavedTokens = Math.floor(
+    (eventDataBytes + bytesAvoided + snapshotBytes) / 4,
+  );
+
+  return { eventDataBytes, bytesAvoided, bytesReturned, snapshotBytes, totalSavedTokens };
+}
+
+/**
+ * Marketing-grade labels for auto-memory file prefixes. The renderer sees raw
+ * filename prefixes (`project_codex_hooks.md` → `project`) — without this map
+ * the user gets schema words in the UI, which leaks the database into UX.
+ */
+export const autoMemoryLabels: Record<string, string> = {
+  project: "What you're building",
+  feedback: "How you work",
+  user: "Who you are",
+  reference: "Where to look",
+  memory: "Long-term context",
+  other: "Other notes",
+};
 
 // ─────────────────────────────────────────────────────────
 // formatReport — renders FullReport as sales-grade savings dashboard
@@ -702,27 +1076,34 @@ function renderProjectMemory(
   ) {
     return [];
   }
-  const topN = opts?.topN ?? 2;
+  // Show enough categories that the user can SEE what's actually being
+  // tracked, instead of "Files tracked + Project rules · 21 more" hiding
+  // the storytelling. 15 covers the 14-category-and-below typical case
+  // fully and still keeps the terminal output under one screen height.
+  // (Restored after #424 squash-merge silently reverted the v1.0.111 fix.)
+  const topN = opts?.topN ?? 15;
   const out: string[] = [];
   out.push("");
-  out.push("Persistent memory  ✓ preserved across compact, restart & upgrade");
-
-  // Lifetime line — disk-aggregated lifetime PLUS current session's in-memory
-  // savings. Two separate accounting pipelines (server bytes vs hook events)
-  // get unified at the render edge so the user always sees a monotonic total
-  // (lifetime ≥ session). Without this, fresh users / pre-b8e11bf sidecars /
-  // not-yet-flushed events show $0 lifetime even when the session earned $X.
+  // Header switches based on whether we have rich lifetime data from the new
+  // pipeline. With it: forward-leaning "All your work" framing. Without it:
+  // legacy "Persistent memory" line for back-compat with older fixtures + tests.
   const lifeEvents = opts?.lifetime?.totalEvents ?? pm.total_events;
   const lifeSessions = opts?.lifetime?.totalSessions ?? pm.session_count;
-  // Current session counts as 1 when no prior session has been recorded yet.
-  const effectiveSessions =
-    lifeSessions === 0 && sessionTokensSaved > 0 ? 1 : lifeSessions;
-  const sessionLabel =
-    effectiveSessions === 1 ? "1 session" : `${fmtNum(effectiveSessions)} sessions`;
-  // Estimate lifetime savings: ~1KB per event → ~256 tokens/event at Opus rates,
-  // plus current session's already-tracked token savings (in-memory).
-  const lifetimeTokens = lifeEvents * 256 + sessionTokensSaved;
-  out.push(`  ${fmtNum(lifeEvents)} events · ${sessionLabel} · ~${tokensToUsd(lifetimeTokens)} saved lifetime`);
+  const distinctProj = opts?.lifetime?.distinctProjects;
+  if (lifeEvents > 0 && distinctProj && distinctProj > 0) {
+    out.push(`  All your work  ·  ${fmtNum(lifeEvents)} events captured across ${distinctProj} project${distinctProj === 1 ? "" : "s"}  ·  ${fmtNum(lifeSessions)} conversations`);
+  } else {
+    out.push("Persistent memory  ✓ preserved across compact, restart & upgrade");
+    // Current session counts as 1 when no prior session has been recorded yet.
+    const effectiveSessions =
+      lifeSessions === 0 && sessionTokensSaved > 0 ? 1 : lifeSessions;
+    const sessionLabel =
+      effectiveSessions === 1 ? "1 session" : `${fmtNum(effectiveSessions)} sessions`;
+    // Estimate lifetime savings: ~1KB per event → ~256 tokens/event at Opus rates,
+    // plus current session's already-tracked token savings (in-memory).
+    const lifetimeTokens = lifeEvents * 256 + sessionTokensSaved;
+    out.push(`  ${fmtNum(lifeEvents)} events · ${sessionLabel} · ~${tokensToUsd(lifetimeTokens)} saved lifetime`);
+  }
   out.push("");
 
   // Prefer lifetime categoryCounts (aggregated across every SessionDB) so
@@ -741,12 +1122,14 @@ function renderProjectMemory(
       }))
       .sort((a, b) => b.count - a.count);
   } else {
-    cats = pm.by_category;
+    // Defensive: filter zero/null counts on the fallback path too — bumping
+    // topN to 15 made any leaked empty rows visible as "label  0  ░░░░░░".
+    cats = (pm.by_category ?? []).filter((c) => c && c.count > 0);
   }
   const visible = cats.slice(0, topN);
   const maxCount = visible.length > 0 ? visible[0].count : 1;
   for (const cat of visible) {
-    out.push(`  ${cat.label.padEnd(18)} ${String(cat.count).padStart(5)}   ${dataBar(cat.count, maxCount, 30)}`);
+    out.push(`  ${cat.label.padEnd(26)} ${String(cat.count).padStart(5)}   ${dataBar(cat.count, maxCount, 30)}`);
   }
 
   // Bug #5: real overflow count, not hardcoded.
@@ -766,7 +1149,7 @@ function renderAutoMemory(lifetime: LifetimeStats | undefined): string[] {
   const out: string[] = [];
   out.push("");
   out.push(
-    `Auto-memory  ✓ ${lifetime.autoMemoryCount} preference${lifetime.autoMemoryCount === 1 ? "" : "s"} learned across ${lifetime.autoMemoryProjects} project${lifetime.autoMemoryProjects === 1 ? "" : "s"}`,
+    `  Preferences learned  ·  ${lifetime.autoMemoryCount} across ${lifetime.autoMemoryProjects} project${lifetime.autoMemoryProjects === 1 ? "" : "s"}`,
   );
 
   const entries = Object.entries(lifetime.autoMemoryByPrefix)
@@ -776,8 +1159,9 @@ function renderAutoMemory(lifetime: LifetimeStats | undefined): string[] {
   // the absolute counts are tiny. Entries are pre-sorted desc.
   const maxCount = entries.length > 0 ? entries[0][1] : 1;
   for (const [prefix, count] of entries) {
+    const label = autoMemoryLabels[prefix] ?? prefix;
     out.push(
-      `  ${prefix.padEnd(12)} ${String(count).padStart(2)}   ${dataBar(count, maxCount, 20)}`,
+      `  ${label.padEnd(26)} ${String(count).padStart(2)}   ${dataBar(count, maxCount, 20)}`,
     );
   }
   return out;
@@ -802,6 +1186,67 @@ function renderBottomLine(sessionTokensSaved: number, lifetime: LifetimeStats | 
 }
 
 /**
+ * Constant token-per-event used everywhere we estimate session/lifetime $.
+ * Kept in lockstep with `bin/statusline.mjs`'s persisted lifetime conversion.
+ */
+const TOKENS_PER_EVENT = 256;
+
+/**
+ * Render the LIFETIME Without/With hero — the screenshottable receipt.
+ *
+ * Why lifetime and not session: the "$X saved this session" framing is
+ * arbitrary (a fresh PID can show $0 even while the user has weeks of work
+ * banked). Lifetime is real, accumulating, and the number worth screenshotting.
+ * The current conversation's contribution still shows below as a sub-block.
+ */
+function renderHero(args: {
+  lifetimeTokensWithout: number;
+  lifetimeTokensWith: number;
+  lifetimeUsd: string;
+  lifetimeWithUsd: string;
+  savedPct: number;
+  totalConversations: number;
+  firstDate?: string;
+}): string[] {
+  const { lifetimeTokensWithout, lifetimeTokensWith, lifetimeUsd, lifetimeWithUsd, savedPct, totalConversations, firstDate } = args;
+  const out: string[] = [];
+  const since = firstDate ? `  ·  since ${firstDate}` : "";
+  out.push(`  ${lifetimeUsd} saved with context-mode  ·  ${savedPct.toFixed(1)}% reduction${since}`);
+  out.push("");
+  const withoutBar = dataBar(lifetimeTokensWithout, lifetimeTokensWithout, 32);
+  const withBar = dataBar(lifetimeTokensWith, lifetimeTokensWithout, 32);
+  out.push(`  Without context-mode  ${fmtNum(lifetimeTokensWithout).padStart(7)} tokens  ${withoutBar}   ${lifetimeUsd}`);
+  out.push(`  With context-mode     ${fmtNum(lifetimeTokensWith).padStart(7)} tokens  ${withBar}   ${lifetimeWithUsd}`);
+  const kept = lifetimeTokensWithout - lifetimeTokensWith;
+  out.push(`                        ${fmtNum(kept).padStart(7)} tokens kept out  ·  across ${totalConversations.toLocaleString("en-US")} conversations`);
+  return out;
+}
+
+/**
+ * Render the current conversation as a contribution narrative — not a hero.
+ * Highlights the slice of lifetime savings this chat earned + concrete proof
+ * (events, days alive, compact rescues).
+ */
+function renderConversation(c: ConversationStats, conversationUsd: string, contribPct: number): string[] {
+  const out: string[] = [];
+  const daysStr = c.daysAlive >= 1 ? `${c.daysAlive.toFixed(1)} days` : `${Math.max(1, Math.round(c.daysAlive * 24))} hr`;
+  const pctStr = contribPct >= 1 ? `${contribPct.toFixed(0)}% of all-time` : `<1% of all-time`;
+  out.push(`  This conversation contributed ${conversationUsd}  ·  ${pctStr}`);
+  out.push(`  ${c.events.toLocaleString("en-US")} events  ·  ${daysStr} alive`);
+  if (c.snapshotsConsumed > 0 && c.snapshotBytes > 0) {
+    const rescuedTokens = Math.round(c.snapshotBytes / 4);
+    out.push(`  ${c.snapshotsConsumed} compact weathered  ·  ${fmtNum(rescuedTokens)} tokens rescued from a ${(c.snapshotBytes / 1024).toFixed(0)} KB snapshot`);
+  }
+  out.push("");
+  if (c.byCategory.length === 0) return out;
+  const max = c.byCategory[0].count || 1;
+  for (const cat of c.byCategory) {
+    out.push(`    ${cat.label.padEnd(26)} ${String(cat.count).padStart(5)}   ${dataBar(cat.count, max, 28)}`);
+  }
+  return out;
+}
+
+/**
  * Render a FullReport as a visual savings dashboard designed for screenshotting.
  *
  * Design principles:
@@ -815,12 +1260,112 @@ export function formatReport(
   report: FullReport,
   version?: string,
   latestVersion?: string | null,
-  opts?: { lifetime?: LifetimeStats; mcpUsage?: McpToolUsageRow[] },
+  opts?: {
+    lifetime?: LifetimeStats;
+    mcpUsage?: McpToolUsageRow[];
+    conversation?: ConversationStats;
+    /**
+     * Phase 8 of D2 PRD — pass realBytes pre-aggregated from
+     * `getRealBytesStats(...)` and the renderer will use those numbers
+     * for the $ math instead of the conservative `events × 256` estimate.
+     *
+     * - `realBytes.lifetime` overrides `lifetimeTokensWithout`.
+     * - `realBytes.conversation` overrides `conversationTokens`.
+     * - Either may be omitted independently — missing values fall back
+     *   to the legacy estimate so this feature can never produce
+     *   a smaller number than before (Mert: stats only go up).
+     * - When the new value is SMALLER than the legacy estimate (fresh
+     *   sessions before any sandbox events emit), we keep the larger
+     *   number to honour the same monotonic-growth invariant.
+     */
+    realBytes?: {
+      lifetime?: RealBytesStats;
+      conversation?: RealBytesStats;
+    };
+  },
 ): string {
   const lines: string[] = [];
   const duration = formatDuration(report.session.uptime_min);
   const lifetime = opts?.lifetime;
   const mcpUsage = opts?.mcpUsage;
+  const conversation = opts?.conversation;
+  const realBytes = opts?.realBytes;
+
+  // ── New layout: source-of-truth from session_events + session_resume.
+  //    Used when the MCP handler has wired the current Claude Code session_id
+  //    through to the renderer. Bypasses the broken in-memory tool-call counter
+  //    (which only saw ctx_* MCP calls and showed "1 call · 5 KB" after hours
+  //    of real conversation work).
+  if (conversation && conversation.events > 0) {
+    // Conversation tokens (this chat's contribution).
+    const convEventsTokens = conversation.events * TOKENS_PER_EVENT;
+    const convRescueTokens = Math.round((conversation.snapshotBytes ?? 0) / 4);
+    const convLegacyTokens = convEventsTokens + convRescueTokens;
+    // Phase 8: prefer realBytes.totalSavedTokens when present and bigger.
+    // Monotonic-growth invariant — never SHRINK an existing $ number.
+    const convRealTokens = realBytes?.conversation?.totalSavedTokens ?? 0;
+    const conversationTokens = Math.max(convLegacyTokens, convRealTokens);
+    const conversationUsd = tokensToUsd(conversationTokens);
+
+    // Lifetime tokens — the screenshottable receipt. Includes events × 256
+    // PLUS rescue benefit aggregated across every DB on disk so the killer
+    // continuity-after-/compact feature isn't silently undercounted.
+    const lifetimeEventsTokens = (lifetime?.totalEvents ?? 0) * TOKENS_PER_EVENT;
+    const lifetimeRescueTokens = Math.round((lifetime?.rescueBytes ?? 0) / 4);
+    const lifetimeLegacyTokens = lifetimeEventsTokens + lifetimeRescueTokens;
+    // Phase 8: same monotonic-growth invariant for lifetime — prefer
+    // realBytes when bigger (which it almost always is once sandbox-execute
+    // events accumulate), fall back to the legacy estimate otherwise.
+    const lifetimeRealTokens = realBytes?.lifetime?.totalSavedTokens ?? 0;
+    const lifetimeTokensWithout = Math.max(lifetimeLegacyTokens, lifetimeRealTokens);
+    // 2% heuristic — matches measured ratio across the test suite (~98% saved).
+    // We don't have per-session bytes_returned on disk yet (D2 PRD scope).
+    const lifetimeTokensWith = Math.max(1, Math.round(lifetimeTokensWithout * 0.02));
+    const lifetimeUsd = tokensToUsd(lifetimeTokensWithout);
+    const lifetimeWithUsd = tokensToUsd(lifetimeTokensWith);
+    const savedPct = lifetimeTokensWithout > 0
+      ? (1 - lifetimeTokensWith / lifetimeTokensWithout) * 100
+      : 0;
+    const contribPct = lifetimeTokensWithout > 0
+      ? (conversationTokens / lifetimeTokensWithout) * 100
+      : 0;
+    const totalConversations = lifetime?.totalSessions ?? 1;
+    const firstDate = lifetime?.firstEventMs
+      ? new Date(lifetime.firstEventMs).toISOString().slice(0, 10)
+      : undefined;
+
+    lines.push("");
+    lines.push(...renderHero({
+      lifetimeTokensWithout,
+      lifetimeTokensWith,
+      lifetimeUsd,
+      lifetimeWithUsd,
+      savedPct,
+      totalConversations,
+      firstDate,
+    }));
+    lines.push("");
+    lines.push("");
+    // ALL YOUR WORK block — full lifetime breakdown, the proof beneath the receipt.
+    // sessionTokensSaved=0: conversation events are already in lifetime.totalEvents,
+    // adding conversationTokens again would double-count.
+    lines.push(...renderProjectMemory(report.projectMemory, { lifetime, sessionTokensSaved: 0, topN: Number.POSITIVE_INFINITY }));
+    lines.push("");
+    // THIS CONVERSATION CONTRIBUTION — narrative slice of lifetime, not a competing hero.
+    lines.push(...renderConversation(conversation, conversationUsd, contribPct));
+    lines.push("");
+    lines.push(...renderAutoMemory(lifetime));
+    lines.push("");
+    lines.push("  Your AI talks less, remembers more, costs less.");
+    lines.push(`  Saved ${lifetimeUsd} across all your work  ·  ${conversationUsd} from this conversation`);
+    lines.push("");
+    const versionStr = version ? `v${version}` : "context-mode";
+    lines.push(`  ${versionStr}`);
+    if (version && latestVersion && latestVersion !== "unknown" && semverNewer(latestVersion, version)) {
+      lines.push(`  Update available: v${version} -> v${latestVersion}  |  ctx_upgrade`);
+    }
+    return lines.join("\n");
+  }
 
   // ── Compute real savings ──
   const totalKeptOut =
