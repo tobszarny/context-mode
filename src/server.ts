@@ -2855,7 +2855,12 @@ server.registerTool(
               realBytes = { conversation: convReal, lifetime: lifeReal };
             }
           } catch { /* never block ctx_stats */ }
-          text = formatReport(report, VERSION, _latestVersion, { lifetime, mcpUsage, multiAdapter, conversation, realBytes });
+          // v1.0.117: pass projectDir as cwd so the narrative renderer's
+          // "started in <path>" line matches the user's actual project, not
+          // the MCP server's chdir'd plugin install dir. getProjectDir()
+          // includes v1.0.115's transcript heuristic which reads the literal
+          // cwd from Claude Code's session jsonl.
+          text = formatReport(report, VERSION, _latestVersion, { lifetime, mcpUsage, multiAdapter, conversation, realBytes, cwd: projectDir });
         } finally {
           sdb.close();
         }
