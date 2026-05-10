@@ -296,8 +296,8 @@ describe("formatReport — Bugs #5/#6/#7/#8", () => {
     // Five mandatory section headers, in order.
     const idx1 = text.indexOf("─── 1. Where you are now ───");
     const idx2 = text.indexOf("─── 2. What this chat captured");
-    const idx3 = text.indexOf("─── 3. The receipt — getting wider ───");
-    const idx4 = text.indexOf("─── 4. For example: what would that cost? ───");
+    const idx3 = text.indexOf("─── 3. The scope, getting wider ───");
+    const idx4 = text.indexOf("─── 4. The bottom line ───");
     const idx5 = text.indexOf("─── 5. What context-mode learned about how you work ───");
     expect(idx1).toBeGreaterThan(-1);
     expect(idx2).toBeGreaterThan(idx1);
@@ -307,7 +307,7 @@ describe("formatReport — Bugs #5/#6/#7/#8", () => {
 
     // Opener — the headline tally.
     expect(text).toMatch(/Across\s+\d+\s+days you ran\s+\d+\s+conversations/);
-    expect(text).toMatch(/context-mode kept\s+356\.0 MB\s+out of your context window/);
+    expect(text).toMatch(/context-mode kept\s+356\.0 MB[^\n]*out of your context window/);
 
     // Section 1 — datetime + days alive + rescue.
     expect(text).toMatch(/started.*\d{4}.*at \d{2}:\d{2}/);
@@ -321,13 +321,13 @@ describe("formatReport — Bugs #5/#6/#7/#8", () => {
     expect(text).toMatch(/Files tracked\s+132/);
 
     // Section 3 — receipt-style rows (no "$X · Y%" framing anymore).
-    expect(text).toMatch(/This conversation\s+/);
-    expect(text).toMatch(/All your real work everywhere/);
-    expect(text).toMatch(/128 chats × 123 projects/);
+    expect(text).toMatch(/This chat:/);
+    expect(text).toMatch(/All your work:/);
+    expect(text).toMatch(/17,493 captures across 123 projects/);
 
     // Section 4 — cost example + EXAMPLES disclaimer.
-    expect(text).toMatch(/\$1399\.73\s+on Opus 4 input alone/);
-    expect(text).toMatch(/These are EXAMPLES, not your actual bill/);
+    expect(text).toMatch(/\$1399\.73 of Opus 4 tokens your team didn't burn/);
+    expect(text).toMatch(/Opus rates shown for context/);
 
     // Section 5 — auto-memory tally.
     expect(text).toMatch(/22 preferences picked up across 6 projects/);

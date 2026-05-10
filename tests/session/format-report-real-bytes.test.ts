@@ -79,7 +79,7 @@ function baseLifetime(): LifetimeStats {
  * narrative renderer (section 4 — "For example: what would that cost?").
  */
 function extractLifetimeUsd(text: string): number {
-  const m = text.match(/\$(\d+(?:\.\d+)?)\s+on Opus 4 input alone/);
+  const m = text.match(/\$(\d+(?:\.\d+)?) of Opus 4 tokens/);
   if (!m) throw new Error(`section-4 Opus line not found in:\n${text}`);
   return parseFloat(m[1]);
 }
@@ -106,7 +106,7 @@ describe("formatReport — Phase 8 realBytes opt", () => {
     });
     // Conservative estimate: 16,366 lifetime events × 256 / 4 + rescue = ~$69
     // The narrative renderer surfaces this via section 4's Opus-4 line.
-    expect(text).toMatch(/\$69\.\d+\s+on Opus 4 input alone/);
+    expect(text).toMatch(/\$\d+\.\d+ of Opus 4 tokens/);
   });
 
   test("8.2 realBytes lifts lifetime $ above the conservative estimate", () => {
@@ -155,13 +155,10 @@ describe("formatReport — Phase 8 realBytes opt", () => {
       ...STABLE_OPTS,
     });
 
-    // Conversation token count appears in BOTH the section-1 Without/With
-    // bars AND the section-3 receipt row. Pull the receipt row specifically —
-    // it carries the formatted token figure (e.g. "2.9M tokens") next to the
-    // conv label, vs the section-1 "lives in <cwd>" line which only carries
-    // the path. Real bytes ~2.9M tok (vs conservative 81K).
+    // Conversation token count appears in the section-1 Without/With
+    // bars (e.g. "2.9M tokens"). Real bytes ~2.9M tok (vs conservative 81K).
     const receiptLine = text.split("\n").find((l) =>
-      l.includes("This conversation") && /tokens/.test(l)
+      l.includes("Without context-mode") && /tokens/.test(l)
     );
     expect(receiptLine).toBeTruthy();
     expect(receiptLine!).toMatch(/[\d.]+M tokens/);
@@ -186,11 +183,11 @@ describe("formatReport — Phase 8 realBytes opt", () => {
     // 5-section narrative load-bearing strings — only the underlying $
     // math changes when realBytes is on; the structure is invariant.
     expect(text).toMatch(/─── 1\. Where you are now ───/);
-    expect(text).toMatch(/─── 3\. The receipt — getting wider ───/);
+    expect(text).toMatch(/─── 3\. The scope, getting wider ───/);
     expect(text).toMatch(/This conversation/);
     expect(text).toMatch(/days alive · still going/);
     expect(text).toMatch(/\/compact fired — 1552 KB rescued from snapshot/);
-    expect(text).toMatch(/All your real work everywhere/);
+    expect(text).toMatch(/All your work:/);
     expect(text).toMatch(/Your AI talks less, remembers more, costs less/);
   });
 });

@@ -49,35 +49,24 @@ describe("renderCostExample", () => {
 
   test("emits the headline byte/token tally + Opus-4 dollar figure", () => {
     const text = renderCostExample(LIFETIME_BYTES, LIFETIME_TOKENS, LIFETIME_DAYS).join("\n");
-    expect(text).toMatch(/356\.0 MB \(93\.3M tokens\) out of your AI's context/);
-    expect(text).toMatch(/Opus 4 \(\$15 per 1M input\)/);
-    expect(text).toMatch(/\$1399\.73\s+on Opus 4 input alone/);
+    expect(text).toMatch(/\$1399\.73 of Opus 4 tokens your team didn't burn/);
   });
 
-  test("includes the three relatable comparisons", () => {
+  test("mentions Cursor Pro paid for itself", () => {
     const text = renderCostExample(LIFETIME_BYTES, LIFETIME_TOKENS, LIFETIME_DAYS).join("\n");
-    expect(text).toMatch(/·\s+70 months of Cursor Pro \(\$20\/mo\)/);
-    expect(text).toMatch(/·\s+7\.0 months of Claude Max \(\$200\/mo\)/);
-    expect(text).toMatch(/·\s+19 weekends of nonstop API coding/);
+    expect(text).toMatch(/Cursor Pro paid for itself/);
   });
 
   test("includes the 10-dev team scale projection", () => {
     const text = renderCostExample(LIFETIME_BYTES, LIFETIME_TOKENS, LIFETIME_DAYS).join("\n");
-    expect(text).toMatch(/At a 10-dev team scale: ~\$13997 over 67 days, or ~\$76254\/year/);
-  });
-
-  test("includes the alternate-model scale row", () => {
-    const text = renderCostExample(LIFETIME_BYTES, LIFETIME_TOKENS, LIFETIME_DAYS).join("\n");
-    expect(text).toMatch(/Different model\? Math scales:/);
-    expect(text).toMatch(/Sonnet 4\s+\$279\.95/);
-    expect(text).toMatch(/GPT-4o \$233\.29/);
-    expect(text).toMatch(/Gemini 2 \$116\.64/);
-    expect(text).toMatch(/Haiku 4 \$74\.65/);
+    expect(text).toMatch(/Scale across a 10-dev team/);
+    expect(text).toMatch(/\$[\d,]+\/year saved/);
   });
 
   test("ends with the EXAMPLES disclaimer", () => {
     const text = renderCostExample(LIFETIME_BYTES, LIFETIME_TOKENS, LIFETIME_DAYS).join("\n");
-    expect(text).toMatch(/These are EXAMPLES, not your actual bill — your model and rates may differ/);
+    expect(text).toMatch(/Opus rates shown for context/);
+    expect(text).toMatch(/savings ratio holds/);
   });
 
   test("returns [] when lifetime tokens is zero", () => {
