@@ -258,8 +258,12 @@ describe("Gemini CLI hooks — MCP cwd != hook projectDir worktree-suffix (#435)
   beforeAll(async () => {
     mcpDir = mkdtempSync(join(tmpdir(), "gemini-mcp-A-"));
     worktreeDir = mkdtempSync(join(tmpdir(), "gemini-wt-B-"));
-    const mcpHash = createHash("sha256").update(mcpDir).digest("hex").slice(0, 16);
-    const wtHash = createHash("sha256").update(worktreeDir).digest("hex").slice(0, 16);
+    // Hooks hash the path AFTER normalizeWorktreePath() (\ → /), so the test
+    // must apply the same normalization before SHA — otherwise on Windows the
+    // expected hash uses backslashes while the hook uses slashes and the
+    // existsSync assertion is vacuously false.
+    const mcpHash = createHash("sha256").update(mcpDir.replace(/\\/g, "/")).digest("hex").slice(0, 16);
+    const wtHash = createHash("sha256").update(worktreeDir.replace(/\\/g, "/")).digest("hex").slice(0, 16);
     const configDir = join(homedir(), ".gemini", "context-mode");
     const sessionsDir = join(configDir, "sessions");
     // Ensure DEBUG_LOG parent dir exists — aftertool.mjs appends to
