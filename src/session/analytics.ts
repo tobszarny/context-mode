@@ -1339,6 +1339,35 @@ export const autoMemoryLabels: Record<string, string> = {
   other: "Other notes",
 };
 
+/**
+ * Marketing-grade labels for adapter ids surfaced by
+ * {@link enumerateAdapterDirs} / {@link getMultiAdapterLifetimeStats}.
+ * The renderer never shows raw IDs — UX uses the names users see in
+ * each tool's own surface area.
+ */
+export const adapterLabels: Record<string, string> = {
+  "claude-code":       "Claude Code",
+  "gemini-cli":        "Gemini CLI",
+  "antigravity":       "Antigravity",
+  "openclaw":          "Openclaw",
+  "codex":             "Codex CLI",
+  "cursor":            "Cursor",
+  "vscode-copilot":    "VS Code Copilot",
+  "kiro":              "Kiro",
+  "pi":                "Pi",
+  "omp":               "OMP",
+  "qwen-code":         "Qwen Code",
+  "kilo":              "Kilo",
+  "opencode":          "OpenCode",
+  "zed":               "Zed",
+  "jetbrains-copilot": "JetBrains",
+};
+
+/** Look up an adapter's marketing label. Falls back to the raw id. */
+function adapterLabel(name: string): string {
+  return adapterLabels[name] ?? name;
+}
+
 // ─────────────────────────────────────────────────────────
 // formatReport — renders FullReport as sales-grade savings dashboard
 // ─────────────────────────────────────────────────────────
@@ -1402,14 +1431,29 @@ function dataBar(bytes: number, maxBytes: number, width: number = 40): string {
  */
 function renderProjectMemory(
   pm: FullReport["projectMemory"],
-  opts?: { lifetime?: LifetimeStats; topN?: number; sessionTokensSaved?: number },
+  opts?: {
+    lifetime?: LifetimeStats;
+    topN?: number;
+    sessionTokensSaved?: number;
+    /**
+     * B3b Slice 3.6 — when supplied, the "All your work" header is
+     * promoted to "All your work everywhere" and the lifetime totals
+     * use the multi-adapter sums (events / sessions / bytes aggregated
+     * across every adapter dir on disk) instead of the single-dir
+     * lifetime numbers. The category bars still come from the single-dir
+     * lifetime.categoryCounts because the multi-adapter scan today does
+     * not bucket categories.
+     */
+    multiAdapter?: MultiAdapterLifetimeStats;
+  },
 ): string[] {
   const sessionTokensSaved = opts?.sessionTokensSaved ?? 0;
   // Render when EITHER disk has data OR current session has earnings.
   if (
     pm.total_events === 0 &&
     (opts?.lifetime?.totalEvents ?? 0) === 0 &&
-    sessionTokensSaved === 0
+    sessionTokensSaved === 0 &&
+    (opts?.multiAdapter?.totalEvents ?? 0) === 0
   ) {
     return [];
   }
@@ -1424,11 +1468,20 @@ function renderProjectMemory(
   // Header switches based on whether we have rich lifetime data from the new
   // pipeline. With it: forward-leaning "All your work" framing. Without it:
   // legacy "Persistent memory" line for back-compat with older fixtures + tests.
-  const lifeEvents = opts?.lifetime?.totalEvents ?? pm.total_events;
-  const lifeSessions = opts?.lifetime?.totalSessions ?? pm.session_count;
+  // Slice 3.6: promote to "All your work everywhere" when multi-adapter
+  // aggregation is supplied so the receipt scope matches the rendered totals.
+  const ma = opts?.multiAdapter;
+  const realAdapters = ma?.perAdapter.filter((a) => a.isReal).length ?? 0;
+  const lifeEvents = ma?.totalEvents
+    ?? opts?.lifetime?.totalEvents
+    ?? pm.total_events;
+  const lifeSessions = ma?.totalSessions
+    ?? opts?.lifetime?.totalSessions
+    ?? pm.session_count;
   const distinctProj = opts?.lifetime?.distinctProjects;
   if (lifeEvents > 0 && distinctProj && distinctProj > 0) {
-    out.push(`  All your work  ·  ${fmtNum(lifeEvents)} events captured across ${distinctProj} project${distinctProj === 1 ? "" : "s"}  ·  ${fmtNum(lifeSessions)} conversations`);
+    const everywhere = realAdapters >= 2 ? " everywhere" : "";
+    out.push(`  All your work${everywhere}  ·  ${fmtNum(lifeEvents)} events captured across ${distinctProj} project${distinctProj === 1 ? "" : "s"}  ·  ${fmtNum(lifeSessions)} conversations`);
   } else {
     out.push("Persistent memory  ✓ preserved across compact, restart & upgrade");
     // Current session counts as 1 when no prior session has been recorded yet.
@@ -1584,6 +1637,69 @@ function renderConversation(c: ConversationStats, conversationUsd: string, contr
 }
 
 /**
+ * B3b Slice 3.2/3.3 — render the "Where it came from" sub-block from a
+ * `MultiAdapterLifetimeStats` (analytics.ts:1231-1240). Two layers:
+ *
+ *  1. Real adapters (`isReal=true`) become a table row each:
+ *       Tool          Captures   Indexed     Total kept out
+ *       Claude Code     17.4K    276.7 MB        291.1 MB
+ *       JetBrains            —     8.6 MB          8.6 MB
+ *
+ *  2. Filtered adapters (`isReal=false` but with at least one .db on disk)
+ *     become a single "Skipped (N): name1, name2, ..." disclosure line so
+ *     the user sees that fixtures/probes were intentionally hidden.
+ *
+ * Returns [] when `multiAdapter` is undefined OR when there are no real
+ * adapters AND nothing skipped — keeping the renderer additive (Slice 3.5).
+ */
+function renderMultiAdapter(multiAdapter: MultiAdapterLifetimeStats | undefined): string[] {
+  if (!multiAdapter) return [];
+  const real     = multiAdapter.perAdapter.filter((a) => a.isReal);
+  const skipped  = multiAdapter.perAdapter.filter((a) => !a.isReal);
+  if (real.length === 0 && skipped.length === 0) return [];
+
+  const out: string[] = [];
+  if (real.length > 0) {
+    out.push("");
+    out.push("Where it came from (tools you actually used — fixtures + probes filtered):");
+    out.push("");
+    // Column widths chosen so the demo render stays visually aligned even
+    // for adapters with very long marketing names. Right-aligned numerics.
+    const NAME_W = 16;
+    const CAP_W  = 10;
+    const IDX_W  = 10;
+    const TOT_W  = 16;
+    out.push(
+      `  ${"Tool".padEnd(NAME_W)}${"Captures".padStart(CAP_W)}${"Indexed".padStart(IDX_W)}${"Total kept out".padStart(TOT_W)}`,
+    );
+    // Sort by total kept out desc — biggest contributor first.
+    const sorted = [...real].sort(
+      (a, b) => (b.dataBytes + b.rescueBytes) - (a.dataBytes + a.rescueBytes),
+    );
+    for (const a of sorted) {
+      const total = a.dataBytes + a.rescueBytes;
+      // Em-dash for zero captures so the column reads "—" not "0".
+      const captures = a.eventCount > 0 ? fmtNum(a.eventCount) : "—";
+      const indexed  = kb(a.dataBytes);
+      const totalStr = kb(total);
+      out.push(
+        `  ${adapterLabel(a.name).padEnd(NAME_W)}${captures.padStart(CAP_W)}${indexed.padStart(IDX_W)}${totalStr.padStart(TOT_W)}`,
+      );
+    }
+  }
+
+  if (skipped.length > 0) {
+    if (real.length > 0) out.push("");
+    const names = skipped.map((a) => adapterLabel(a.name)).join(", ");
+    out.push(`  Skipped (${skipped.length}): ${names}`);
+    out.push("  These adapters have DBs on disk but only test fixtures, dev skeletons,");
+    out.push("  or detection probes — no real chat activity.");
+  }
+
+  return out;
+}
+
+/**
  * Render a FullReport as a visual savings dashboard designed for screenshotting.
  *
  * Design principles:
@@ -1619,6 +1735,16 @@ export function formatReport(
       lifetime?: RealBytesStats;
       conversation?: RealBytesStats;
     };
+    /**
+     * B3b — multi-adapter aggregation surfaced by
+     * `getMultiAdapterLifetimeStats(...)` (analytics.ts:1248). When present,
+     * the renderer adds a "Where it came from" sub-block under the receipt,
+     * promotes the headline to "across N AI tools" when >= 2 real adapters
+     * are detected, and renames the all-work block to "All your work
+     * everywhere". Backward compat: omitting this opt preserves the legacy
+     * single-adapter renderer output unchanged.
+     */
+    multiAdapter?: MultiAdapterLifetimeStats;
   },
 ): string {
   const lines: string[] = [];
@@ -1627,6 +1753,40 @@ export function formatReport(
   const mcpUsage = opts?.mcpUsage;
   const conversation = opts?.conversation;
   const realBytes = opts?.realBytes;
+  const multiAdapter = opts?.multiAdapter;
+  // Real-adapter count drives the "across N AI tools" headline copy
+  // (Slice 3.4) — we only call something a "tool you used" once it
+  // passes the isReal filter inside getMultiAdapterLifetimeStats.
+  const realAdapterCount = multiAdapter?.perAdapter.filter((a) => a.isReal).length ?? 0;
+
+  // ── B3b Slice 3.4: opening tagline — runs in EVERY render path so the
+  // multi-adapter headline appears regardless of which formatReport branch
+  // executes (active session / fresh / per-conversation). Falls back to
+  // "in Claude Code" when only one adapter qualifies as real, matching the
+  // Mert-approved demo wording. Suppressed entirely without multiAdapter
+  // so legacy single-adapter renders stay byte-identical (Slice 3.5).
+  if (multiAdapter && realAdapterCount > 0) {
+    const totalConvs = multiAdapter.totalSessions || lifetime?.totalSessions || 0;
+    const sinceMs = lifetime?.firstEventMs ?? 0;
+    const days = sinceMs > 0
+      ? Math.max(1, Math.round((Date.now() - sinceMs) / 86_400_000))
+      : 0;
+    const daySegment = days > 0 ? `Across ${days} day${days === 1 ? "" : "s"} ` : "";
+    const convStr = totalConvs > 0
+      ? `you ran ${fmtNum(totalConvs)} conversation${totalConvs === 1 ? "" : "s"} `
+      : "you ran ";
+    let where: string;
+    if (realAdapterCount >= 2) {
+      where = `across ${realAdapterCount} AI tools`;
+    } else {
+      // Single real adapter — use its marketing label (defaults to Claude Code
+      // if for some reason the only real adapter has no entry in adapterLabels).
+      const onlyReal = multiAdapter.perAdapter.find((a) => a.isReal);
+      where = `in ${onlyReal ? adapterLabel(onlyReal.name) : "Claude Code"}`;
+    }
+    lines.push(`${daySegment}${convStr}${where}.`);
+    lines.push("");
+  }
 
   // ── New layout: source-of-truth from session_events + session_resume.
   //    Used when the MCP handler has wired the current Claude Code session_id
@@ -1686,7 +1846,9 @@ export function formatReport(
     // ALL YOUR WORK block — full lifetime breakdown, the proof beneath the receipt.
     // sessionTokensSaved=0: conversation events are already in lifetime.totalEvents,
     // adding conversationTokens again would double-count.
-    lines.push(...renderProjectMemory(report.projectMemory, { lifetime, sessionTokensSaved: 0, topN: Number.POSITIVE_INFINITY }));
+    lines.push(...renderProjectMemory(report.projectMemory, { lifetime, multiAdapter, sessionTokensSaved: 0, topN: Number.POSITIVE_INFINITY }));
+    // B3b Slice 3.2/3.3 — per-adapter "Where it came from" sub-block.
+    lines.push(...renderMultiAdapter(multiAdapter));
     lines.push("");
     // THIS CONVERSATION CONTRIBUTION — narrative slice of lifetime, not a competing hero.
     lines.push(...renderConversation(conversation, conversationUsd, contribPct));
@@ -1728,7 +1890,8 @@ export function formatReport(
     }
 
     // Project memory + auto-memory + bottom line
-    lines.push(...renderProjectMemory(report.projectMemory, { lifetime, sessionTokensSaved: 0 }));
+    lines.push(...renderProjectMemory(report.projectMemory, { lifetime, multiAdapter, sessionTokensSaved: 0 }));
+    lines.push(...renderMultiAdapter(multiAdapter));
     lines.push(...renderAutoMemory(lifetime));
     lines.push(...renderBottomLine(0, lifetime));
 
@@ -1817,7 +1980,12 @@ export function formatReport(
   }
 
   // ── Project memory — persistent across sessions (Bug #3 + #5) ──
-  lines.push(...renderProjectMemory(report.projectMemory, { lifetime, sessionTokensSaved: tokensSaved }));
+  lines.push(...renderProjectMemory(report.projectMemory, { lifetime, multiAdapter, sessionTokensSaved: tokensSaved }));
+
+  // ── B3b Slice 3.2/3.3 — "Where it came from" per-adapter sub-block.
+  // Sits under the lifetime memory block so the receipt-to-source flow is
+  // visually contiguous (lifetime totals → which tools produced them).
+  lines.push(...renderMultiAdapter(multiAdapter));
 
   // ── Auto-memory — Claude Code's preference learnings (Bug #4) ──
   lines.push(...renderAutoMemory(lifetime));
