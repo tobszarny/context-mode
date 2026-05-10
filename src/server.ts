@@ -2599,7 +2599,11 @@ server.registerTool(
           // Lifetime stats span every project's SessionDB + auto-memory dir
           // (Bugs #3/#4); failures are absorbed inside getLifetimeStats so a
           // corrupt sidecar can never break ctx_stats.
-          const lifetime = getLifetimeStats();
+          // B3b Slice 3.1: scope to active adapter via getSessionDir() so
+          // non-Claude platforms (Cursor, OpenCode, JetBrains, ...) read
+          // from THEIR sessions dir — not the hardcoded ~/.claude/ default.
+          // Mirrors the statusline contract at src/server.ts:540.
+          const lifetime = getLifetimeStats({ sessionsDir: getSessionDir() });
           text = formatReport(report, VERSION, _latestVersion, { lifetime, mcpUsage });
         } finally {
           sdb.close();
@@ -2609,7 +2613,7 @@ server.registerTool(
         // Lifetime still meaningful (other projects, auto-memory) so include it.
         const engine = new AnalyticsEngine(createMinimalDb());
         const report = engine.queryAll(sessionStats);
-        const lifetime = getLifetimeStats();
+        const lifetime = getLifetimeStats({ sessionsDir: getSessionDir() });
         text = formatReport(report, VERSION, _latestVersion, { lifetime });
       }
     } catch {
@@ -2617,7 +2621,7 @@ server.registerTool(
       const engine = new AnalyticsEngine(createMinimalDb());
       const report = engine.queryAll(sessionStats);
       let lifetime;
-      try { lifetime = getLifetimeStats(); } catch { /* never block ctx_stats */ }
+      try { lifetime = getLifetimeStats({ sessionsDir: getSessionDir() }); } catch { /* never block ctx_stats */ }
       text = formatReport(report, VERSION, _latestVersion, lifetime ? { lifetime } : undefined);
     }
 

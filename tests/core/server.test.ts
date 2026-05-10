@@ -2318,6 +2318,33 @@ describe("Project dir hash consistency", () => {
     expect(purgeMatch![0]).toContain("hashProjectDir");
     expect(purgeMatch![0]).not.toContain("createHash");
   });
+
+  // ── B3b Slice 3.1: ctx_stats must scope getLifetimeStats to the active
+  //    adapter via getSessionDir(), not the hardcoded ~/.claude/ default.
+  //    Bug evidence: src/server.ts:2602/2612/2620 currently call
+  //    `getLifetimeStats()` with no args, so non-Claude platforms (Cursor,
+  //    OpenCode, JetBrains, ...) silently aggregate from the wrong dir.
+  //    Statusline at src/server.ts:540 already passes
+  //    `{ sessionsDir: getSessionDir() }` — the three ctx_stats sites must
+  //    mirror that contract exactly (or wrap it via the multi-adapter helper).
+  test("ctx_stats scopes lifetime aggregation to the active adapter sessionsDir", () => {
+    const statsMatch = serverSrc.match(
+      /server\.registerTool\(\s*"ctx_stats"[\s\S]*?^\);/m,
+    );
+    expect(statsMatch).not.toBeNull();
+    const body = statsMatch![0];
+    // Every getLifetimeStats / getMultiAdapterLifetimeStats invocation inside
+    // ctx_stats MUST be argumented (sessionsDir-aware). A bare `()` call falls
+    // back to the hardcoded ~/.claude/context-mode/sessions default and
+    // silently mis-attributes lifetime counts on non-Claude platforms.
+    const bareCalls = body.match(
+      /get(?:MultiAdapter)?LifetimeStats\(\s*\)/g,
+    );
+    expect(bareCalls, "ctx_stats must not call getLifetimeStats()/getMultiAdapterLifetimeStats() with no args").toBeNull();
+    // Should pass an object literal containing `sessionsDir` to whichever
+    // helper it uses (mirrors the statusline contract at src/server.ts:540).
+    expect(body).toMatch(/get(?:MultiAdapter)?LifetimeStats\(\s*\{\s*sessionsDir:\s*getSessionDir\(\)/);
+  });
 });
 
 // ─── Purge deleted array honesty ─────────────────────────────────────────────
