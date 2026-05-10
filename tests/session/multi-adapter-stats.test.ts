@@ -126,9 +126,11 @@ describe("Slice 2.1 — enumerateAdapterDirs()", () => {
     const dirs = enumerateAdapterDirs({ home });
     // Use path.join() so the expected prefix/suffix match the platform's
     // separator. enumerateAdapterDirs uses node:path.join under the hood,
-    // which emits backslashes on Windows; hardcoded "/" assertions are
-    // vacuously false there.
-    const expectedHomePrefix = home + sep;
+    // which emits backslashes on Windows AND converts the leading "/" of
+    // "/HOME" to "\\". Normalize the home prefix through join() too — a
+    // raw "/HOME" + sep would compare against an apple-and-orange first
+    // character on Windows ("/HOME\\..." vs actual "\\HOME\\...").
+    const expectedHomePrefix = join(home) + sep;
     const expectedSessionsSuffix = sep + join("context-mode", "sessions");
     const expectedContentSuffix = sep + join("context-mode", "content");
     for (const d of dirs) {
