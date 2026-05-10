@@ -872,33 +872,14 @@ Full configs: [`configs/kiro/mcp.json`](configs/kiro/mcp.json) | [`configs/kiro/
 
 **Install — manual plugin path (if `omp plugin install` is unavailable):**
 
-OMP plugins live in `~/.omp/plugins/`. Add `context-mode` directly:
+OMP loads anything listed under `~/.omp/plugins/package.json` `dependencies` whose own `package.json` carries an `omp` (or `pi`) field. New plugins default to enabled — the lock file at `~/.omp/plugins/omp-plugins.lock.json` is only consulted when a plugin needs to be explicitly **disabled** (loader skips `runtimeState && !runtimeState.enabled` per [`extensibility/plugins/loader.ts:89-94`](https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/src/extensibility/plugins/loader.ts)). So the manual install is two commands:
 
-1. Install into the OMP plugins workspace:
+```bash
+cd ~/.omp/plugins
+bun add context-mode    # or: npm install context-mode
+```
 
-   ```bash
-   cd ~/.omp/plugins
-   bun add context-mode    # or: npm install context-mode
-   ```
-
-2. Tell OMP the plugin is enabled by editing `~/.omp/plugins/omp-plugins.lock.json` (create the file if missing):
-
-   ```json
-   {
-     "plugins": {
-       "context-mode": {
-         "version": "1.0.111",
-         "enabledFeatures": null,
-         "enabled": true
-       }
-     },
-     "settings": {}
-   }
-   ```
-
-3. Restart OMP.
-
-This is exactly what `omp plugin install` does internally — see upstream [`extensibility/plugins/manager.ts:158`](https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/src/extensibility/plugins/manager.ts) (`bun install` into `getPluginsDir()`) and [`types.ts:141`](https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/src/extensibility/plugins/types.ts) (`PluginRuntimeConfig` shape stored in `omp-plugins.lock.json`).
+Then restart OMP. No lock file edit, no version pin — version is read from the freshly-installed package each time the loader runs (see [`loader.ts:87`](https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/src/extensibility/plugins/loader.ts) `manifest.version = pluginPkg.version`).
 
 **Install — MCP-only path (no plugin):**
 
