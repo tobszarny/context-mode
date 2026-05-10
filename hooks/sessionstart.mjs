@@ -164,7 +164,25 @@ await runHook(async () => {
       // If cleanup flag exists from a PREVIOUS startup that was never followed by
       // resume, that was a true fresh start — aggressively wipe all data.
       db.cleanupOldSessions(7);
-      db.db.exec(`DELETE FROM session_events WHERE session_id NOT IN (SELECT session_id FROM session_meta)`);
+      // Bug fix: the unconditional DELETE below USED to wipe ALL orphan
+      // events (any session_id missing from session_meta). On a power-outage
+      // restart this destroyed 1000+ events of real Claude Code work whose
+      // UUID session_ids hadn't yet had their session_meta row written
+      // (timing window between insertEvent and ensureSession). See
+      // tests/session/cleanup-preserves-live-uuid-events.test.ts.
+      //
+      // Now: protect anything that LOOKS like a real session UUID
+      // (4 dashes per RFC 4122 8-4-4-4-12), unless it's already older than
+      // the 7-day cleanup horizon. Detection-probe orphans like 'pid-12345'
+      // (no UUID shape) are still wiped aggressively — they're noise.
+      db.db.exec(`
+        DELETE FROM session_events
+         WHERE session_id NOT IN (SELECT session_id FROM session_meta)
+           AND (
+             session_id NOT GLOB '*-*-*-*-*'              -- pid-XXX probes etc.
+             OR created_at < datetime('now', '-7 day')    -- truly abandoned UUIDs
+           )
+      `);
 
       // Proactively capture CLAUDE.md files — Claude Code loads them as system
       // context at startup, invisible to PostToolUse hooks. We read them from
