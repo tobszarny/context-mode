@@ -40,7 +40,7 @@ import { searchAllSources } from "./search/unified.js";
 import { buildNodeCommand, type HookAdapter } from "./adapters/types.js";
 import { detectPlatform, getSessionDirSegments } from "./adapters/detect.js";
 import { loadDatabase } from "./db-base.js";
-import { AnalyticsEngine, formatReport, getLifetimeStats, getMultiAdapterLifetimeStats, OPUS_INPUT_PRICE_PER_TOKEN } from "./session/analytics.js";
+import { AnalyticsEngine, formatReport, getConversationStats, getLifetimeStats, getMultiAdapterLifetimeStats, getRealBytesStats, OPUS_INPUT_PRICE_PER_TOKEN } from "./session/analytics.js";
 const __pkg_dir = dirname(fileURLToPath(import.meta.url));
 const VERSION: string = (() => {
   for (const rel of ["../package.json", "./package.json"]) {
@@ -2610,7 +2610,30 @@ server.registerTool(
           // sidecar in any adapter dir cannot break ctx_stats.
           let multiAdapter;
           try { multiAdapter = getMultiAdapterLifetimeStats(); } catch { /* never block ctx_stats */ }
-          text = formatReport(report, VERSION, _latestVersion, { lifetime, mcpUsage, multiAdapter });
+          // F1: wire conversation + realBytes opts so formatReport renders the
+          // narrative 5-section "kitap gibi" layout (timeline, ladder, receipt,
+          // example cost, auto-memory). Without these, formatReport falls back
+          // to the legacy active-session header. Best-effort — failures absorbed.
+          // Resolve session_id: prefer env (CLAUDE_SESSION_ID), else most-recent
+          // UUID session_id from session_events in this DB.
+          let conversation;
+          let realBytes;
+          try {
+            let sid = process.env.CLAUDE_SESSION_ID;
+            if (!sid) {
+              const row = sdb.prepare(
+                "SELECT session_id FROM session_events WHERE session_id LIKE '________-____-____-____-____________' ORDER BY created_at DESC LIMIT 1"
+              ).get() as { session_id: string } | undefined;
+              sid = row?.session_id;
+            }
+            if (sid) {
+              conversation = getConversationStats({ sessionId: sid, sessionsDir: getSessionDir(), worktreeHash: dbHash });
+              const convReal = getRealBytesStats({ sessionId: sid, sessionsDir: getSessionDir(), worktreeHash: dbHash });
+              const lifeReal = getRealBytesStats({ sessionsDir: getSessionDir() });
+              realBytes = { conversation: convReal, lifetime: lifeReal };
+            }
+          } catch { /* never block ctx_stats */ }
+          text = formatReport(report, VERSION, _latestVersion, { lifetime, mcpUsage, multiAdapter, conversation, realBytes });
         } finally {
           sdb.close();
         }
