@@ -10,6 +10,7 @@
  */
 
 import { existsSync, readdirSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { loadDatabase as loadDatabaseImpl } from "../db-base.js";
 import { resolveClaudeConfigDir } from "../util/claude-config.js";
