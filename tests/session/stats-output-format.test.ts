@@ -91,13 +91,20 @@ describe("formatReport — Bugs #5/#6/#7/#8", () => {
     expect(text).not.toMatch(/\b\d+\.\dx\b(?!\s+longer)/);
   });
 
-  test("computes the real overflow count (not hardcoded '9 more')", () => {
+  test("never emits the legacy hardcoded '9 more categories' string", () => {
     const text = formatReport(baseReport(), "1.0.103", null, {
       lifetime: emptyLifetime(),
     });
-    // baseReport has 8 categories; we render 2 → 6 more.
-    expect(text).toMatch(/6 more categories/);
+    // Slice 5 — Mert: 'honest, no tease'. The renderer no longer emits
+    // any "+ N more categor" overflow line; instead all 8 baseReport
+    // categories appear in full. The legacy hardcoded "9 more categories"
+    // bug must never come back regardless.
     expect(text).not.toMatch(/9 more categories/);
+    expect(text).not.toMatch(/\d+ more categor/);
+    // Every baseReport category label must show up.
+    for (const c of baseReport().projectMemory.by_category) {
+      expect(text).toContain(c.label);
+    }
   });
 
   test("ends with a 'Bottom line' / business-value footer", () => {
@@ -110,7 +117,13 @@ describe("formatReport — Bugs #5/#6/#7/#8", () => {
     expect(text).toMatch(/\$\d+(\.\d{2})? lifetime/);
   });
 
-  test("renders auto-memory section when files are present", () => {
+  test("renders the auto-memory block when files are present", () => {
+    // Updated to current renderer copy: legacy active-session path emits
+    // "Preferences learned  ·  N across K projects" (no "Auto-memory"
+    // header label — that was the early prototype copy). The narrative
+    // renderer's section 5 surfaces the same data via "N preferences
+    // picked up across K projects". Either path satisfies the spirit
+    // of the test: the auto-memory data must be visible.
     const text = formatReport(baseReport(), "1.0.103", null, {
       lifetime: {
         totalEvents: 160,
@@ -120,10 +133,14 @@ describe("formatReport — Bugs #5/#6/#7/#8", () => {
         autoMemoryByPrefix: { user: 4, feedback: 7, project: 5, reference: 2 },
       },
     });
-    expect(text).toMatch(/Auto-memory/);
-    expect(text).toMatch(/18 preferences learned/);
-    expect(text).toMatch(/across 6 projects/);
-    expect(text).toMatch(/feedback\s+7/);
+    expect(text).toMatch(/Preferences learned|preferences picked up/);
+    expect(text).toMatch(/18\s+(preferences|across)/);
+    expect(text).toMatch(/across 6 project/);
+    // The renderer translates raw prefixes via autoMemoryLabels:
+    //   feedback → "How you work"  (count 7 in this fixture)
+    //   project  → "What you're building" (count 5)
+    // Assert the displayed label, not the raw prefix.
+    expect(text).toMatch(/How you work\s+7/);
   });
 
   // ── Cycle 1: Auto-memory must include proportional bars (Mert: "no bars") ──
@@ -137,12 +154,15 @@ describe("formatReport — Bugs #5/#6/#7/#8", () => {
         autoMemoryByPrefix: { project: 11, memory: 6, feedback: 3, user: 1, reference: 1 },
       },
     });
-    // Must have bar characters in the auto-memory block.
-    expect(text).toMatch(/Auto-memory[\s\S]*?█/);
+    // Auto-memory block has bars under the "Preferences learned" header.
+    expect(text).toMatch(/Preferences learned[\s\S]*?█/);
     // Largest entry (project=11) bar must be wider than smallest (reference=1).
-    // Capture each row's bar width by counting █ chars.
-    const projectBar = (text.match(/^\s+project\s+\d+\s+(█+)/m) ?? [])[1] ?? "";
-    const referenceBar = (text.match(/^\s+reference\s+\d+\s+(█+)/m) ?? [])[1] ?? "";
+    // The renderer translates raw prefixes via autoMemoryLabels — capture
+    // bar widths against the rendered LABELS:
+    //   project   → "What you're building"
+    //   reference → "Where to look"
+    const projectBar = (text.match(/What you're building\s+\d+\s+(█+)/) ?? [])[1] ?? "";
+    const referenceBar = (text.match(/Where to look\s+\d+\s+(█+)/) ?? [])[1] ?? "";
     expect(projectBar.length).toBeGreaterThan(0);
     expect(referenceBar.length).toBeGreaterThan(0);
     expect(projectBar.length).toBeGreaterThan(referenceBar.length);
