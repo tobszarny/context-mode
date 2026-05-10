@@ -114,10 +114,17 @@ function bunExists(): boolean {
 }
 
 function bunCommand(): string {
-  if (commandExists("bun")) return "bun";
+  // Prefer absolute .exe paths so spawn() can run with shell:false on Windows.
+  // `where bun` may resolve to a `bun.cmd` npm shim (#506) which CreateProcess
+  // cannot execute directly — return the real .exe wherever we can find one.
   for (const p of bunFallbackPaths()) {
     if (existsSync(p)) return p;
   }
+  // Bare name only if PATH resolution confirms it. On Windows this is
+  // typically a .cmd shim — the executor's needsShell list (which now
+  // includes "bun" — see #506) ensures shell:true so cmd.exe can resolve it.
+  if (commandExists("bun")) return "bun";
+  // Synthetic last-resort path for diagnostics/error messages.
   const home = process.env.HOME ?? process.env.USERPROFILE ?? "";
   return isWindows ? `${home}\\.bun\\bin\\bun.exe` : `${home}/.bun/bin/bun`;
 }
@@ -127,9 +134,17 @@ function bunFallbackPaths(): string[] {
   const home = process.env.HOME ?? process.env.USERPROFILE ?? "";
   if (isWindows) {
     const localAppData = process.env.LOCALAPPDATA ?? "";
+    const appData = process.env.APPDATA ?? "";
     return [
+      // Native bun installer locations (irm bun.sh/install.ps1).
       ...(home ? [`${home}\\.bun\\bin\\bun.exe`] : []),
       ...(localAppData ? [`${localAppData}\\bun\\bin\\bun.exe`] : []),
+      // npm i -g bun installs bun.exe under the npm prefix (typically
+      // %APPDATA%\npm\node_modules\bun\bin\bun.exe). Without this, npm
+      // installs were "found" via bun.cmd shim on PATH and the bare "bun"
+      // string was returned — spawn() then ENOENT'd because CreateProcess
+      // can't execute .cmd files (#506).
+      ...(appData ? [`${appData}\\npm\\node_modules\\bun\\bin\\bun.exe`] : []),
     ];
   }
   return home ? [`${home}/.bun/bin/bun`] : [];
