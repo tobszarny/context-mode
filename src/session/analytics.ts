@@ -9,6 +9,7 @@
  *   const report = engine.queryAll(runtimeStats);
  */
 
+import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -1510,9 +1511,10 @@ export function detectLocaleAndTz(): { locale: string; tz: string } {
   if (!locale) {
     if (process.platform === "darwin") {
       try {
-        // Lazy-require — keeps the helper test-friendly when child_process is stubbed.
-        const cp: typeof import("node:child_process") = require("node:child_process");
-        const out = cp.execFileSync("defaults", ["read", "-g", "AppleLocale"], {
+        // Top-level import — `require()` throws "Dynamic require ... not
+        // supported" under esbuild's ESM shim and pure ESM Node, which silently
+        // dropped this branch and forced en-US fallback in production.
+        const out = execFileSync("defaults", ["read", "-g", "AppleLocale"], {
           encoding: "utf8",
           timeout: 500,
         }).trim();
