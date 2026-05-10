@@ -27,7 +27,7 @@
 
 import { existsSync, readFileSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
 
@@ -35,15 +35,22 @@ import { execFileSync } from "node:child_process";
 // statusline.mjs ships in `bin/`; the compiled analytics module lives in
 // `build/session/analytics.js`. Import lazily so a missing build doesn't
 // crash the renderer — degrade to the substantiated headline instead.
+//
+// The dynamic import target MUST be a `file://` URL on Windows. Node's
+// ESM loader rejects absolute drive-letter paths (`C:\...`) with
+// ERR_UNSUPPORTED_ESM_URL_SCHEME — which the catch below silently
+// swallows, leaving `_analytics = null` and rendering the empty-state
+// headline forever. Convert to a file URL so Windows accepts it.
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const ANALYTICS_PATH = resolve(__dirname, "..", "build", "session", "analytics.js");
+const ANALYTICS_URL = pathToFileURL(ANALYTICS_PATH).href;
 
 let _analytics = null;
 async function loadAnalytics() {
   if (_analytics) return _analytics;
   try {
-    _analytics = await import(ANALYTICS_PATH);
+    _analytics = await import(ANALYTICS_URL);
   } catch {
     _analytics = null;
   }
