@@ -16,6 +16,11 @@ import { createHash } from "node:crypto";
 import { tmpdir, homedir } from "node:os";
 import { resolve } from "node:path";
 
+
+const _hashCanonical = (p: string) => createHash("sha256").update(
+  (process.platform === "darwin" || process.platform === "win32") ? p.toLowerCase() : p
+).digest("hex").slice(0, 16);
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, "..", "..");
 const HOOKS_DIR = join(__dirname, "..", "..", "hooks", "gemini-cli");
@@ -47,7 +52,7 @@ describe("Gemini CLI hooks", () => {
 
   beforeAll(() => {
     tempDir = mkdtempSync(join(tmpdir(), "gemini-hook-test-"));
-    const hash = createHash("sha256").update(tempDir).digest("hex").slice(0, 16);
+    const hash = _hashCanonical(tempDir);
     const sessionsDir = join(homedir(), ".gemini", "context-mode", "sessions");
     dbPath = join(sessionsDir, `${hash}.db`);
     eventsPath = join(sessionsDir, `${hash}-events.md`);
@@ -262,8 +267,8 @@ describe("Gemini CLI hooks — MCP cwd != hook projectDir worktree-suffix (#435)
     // must apply the same normalization before SHA — otherwise on Windows the
     // expected hash uses backslashes while the hook uses slashes and the
     // existsSync assertion is vacuously false.
-    const mcpHash = createHash("sha256").update(mcpDir.replace(/\\/g, "/")).digest("hex").slice(0, 16);
-    const wtHash = createHash("sha256").update(worktreeDir.replace(/\\/g, "/")).digest("hex").slice(0, 16);
+    const mcpHash = _hashCanonical(mcpDir.replace(/\\/g, "/"));
+    const wtHash = _hashCanonical(worktreeDir.replace(/\\/g, "/"));
     const configDir = join(homedir(), ".gemini", "context-mode");
     const sessionsDir = join(configDir, "sessions");
     // Ensure DEBUG_LOG parent dir exists — aftertool.mjs appends to

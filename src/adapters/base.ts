@@ -17,10 +17,10 @@
  *   - openclaw: overrides backupSettings (searches 3 config paths)
  */
 
-import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { accessSync, copyFileSync, constants, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
+import { hashProjectDirCanonical, resolveSessionDbPath } from "../session/db.js";
 
 export abstract class BaseAdapter {
   constructor(protected readonly sessionDirSegments: string[]) {}
@@ -32,19 +32,21 @@ export abstract class BaseAdapter {
   }
 
   getSessionDBPath(projectDir: string): string {
-    const hash = createHash("sha256")
-      .update(projectDir)
-      .digest("hex")
-      .slice(0, 16);
-    return join(this.getSessionDir(), `${hash}.db`);
+    // Delegates to resolveSessionDbPath for case-fold + worktree-suffix
+    // handling and one-shot migration of legacy raw-casing files. All 12
+    // adapters share this so cross-adapter ctx_stats reads see the same
+    // file the writer produced.
+    return resolveSessionDbPath({
+      projectDir,
+      sessionsDir: this.getSessionDir(),
+    });
   }
 
   getSessionEventsPath(projectDir: string): string {
-    const hash = createHash("sha256")
-      .update(projectDir)
-      .digest("hex")
-      .slice(0, 16);
-    return join(this.getSessionDir(), `${hash}-events.md`);
+    // Sidecar to getSessionDBPath — same canonical hash so they live next
+    // to each other on disk. No migration helper for .md sidecars yet
+    // (they get rewritten on every session); the canonical hash is enough.
+    return join(this.getSessionDir(), `${hashProjectDirCanonical(projectDir)}-events.md`);
   }
 
   /**

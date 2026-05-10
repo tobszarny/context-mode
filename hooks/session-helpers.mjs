@@ -10,8 +10,38 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
+
+// Case-fold the project dir before hashing so the same physical worktree
+// always maps to one DB regardless of casing on macOS HFS+/APFS or Windows
+// NTFS. Mirrors src/session/db.ts hashProjectDirCanonical/Legacy. Linux is
+// strictly case-sensitive so this is a no-op there.
+export function hashCanonical(projectDir) {
+  const normalized = projectDir.replace(/\\/g, "/").replace(/\/+$/, "") || "/";
+  const folded = (process.platform === "darwin" || process.platform === "win32")
+    ? normalized.toLowerCase()
+    : normalized;
+  return createHash("sha256").update(folded).digest("hex").slice(0, 16);
+}
+export function hashLegacy(projectDir) {
+  const normalized = projectDir.replace(/\\/g, "/").replace(/\/+$/, "") || "/";
+  return createHash("sha256").update(normalized).digest("hex").slice(0, 16);
+}
+
+// Build a path under the per-project sessions dir, performing one-shot
+// migration from a legacy raw-casing filename to the canonical one when
+// both points to different files (Mac/Win only). Same rules as
+// resolveSessionDbPath in src/session/db.ts: never overwrite, never throw.
+function migrateAndJoin(dir, canonicalHash, legacyHash, suffix, ext) {
+  const canonical = join(dir, `${canonicalHash}${suffix}${ext}`);
+  if (existsSync(canonical) || canonicalHash === legacyHash) return canonical;
+  const legacy = join(dir, `${legacyHash}${suffix}${ext}`);
+  if (existsSync(legacy)) {
+    try { renameSync(legacy, canonical); } catch { /* best effort */ }
+  }
+  return canonical;
+}
 
 /**
  * Returns the worktree suffix for session path isolation.
@@ -60,8 +90,9 @@ function getMainWorktreeRoot(projectDir) {
 }
 
 function workTreeMarkerPath(projectDir) {
-  const hash = createHash("sha256").update(normalizeWorktreePath(projectDir)).digest("hex").slice(0, 16);
-  return join(tmpdir(), `cm-wt-${hash}.txt`);
+  // Canonical hash so two terminals with different casing of the same
+  // worktree share one marker (and one cached suffix). Mirrors hashCanonical.
+  return join(tmpdir(), `cm-wt-${hashCanonical(normalizeWorktreePath(projectDir))}.txt`);
 }
 
 function getWorktreeSuffix(projectDir = process.cwd()) {
@@ -94,8 +125,18 @@ function getWorktreeSuffix(projectDir = process.cwd()) {
     try {
       const currentRoot = getCurrentWorktreeRoot(projectDir);
       const mainRoot = getMainWorktreeRoot(projectDir);
-      if (currentRoot && mainRoot && currentRoot !== mainRoot) {
-        suffix = `__${createHash("sha256").update(currentRoot).digest("hex").slice(0, 8)}`;
+      if (currentRoot && mainRoot) {
+        // Mirror src/session/db.ts round-5 fix: case-fold the comparison
+        // AND the hash so casing-only path differences on Mac/Win produce
+        // the same suffix (and so the SAME .db file as the server reads).
+        const fold = (s) => (process.platform === "darwin" || process.platform === "win32")
+          ? s.toLowerCase()
+          : s;
+        const canonicalCurrent = fold(currentRoot);
+        const canonicalMain = fold(mainRoot);
+        if (canonicalCurrent !== canonicalMain) {
+          suffix = `__${createHash("sha256").update(canonicalCurrent).digest("hex").slice(0, 8)}`;
+        }
       }
     } catch {
       // git not available or not a git repo — no suffix
@@ -257,10 +298,9 @@ export function getSessionId(input, opts = CLAUDE_OPTS) {
  */
 export function getSessionDBPath(opts = CLAUDE_OPTS, projectDirOverride) {
   const projectDir = normalizeWorktreePath(projectDirOverride ?? getProjectDir(opts));
-  const hash = createHash("sha256").update(projectDir).digest("hex").slice(0, 16);
   const dir = join(resolveConfigDir(opts), "context-mode", "sessions");
   mkdirSync(dir, { recursive: true });
-  return join(dir, `${hash}${getWorktreeSuffix(projectDir)}.db`);
+  return migrateAndJoin(dir, hashCanonical(projectDir), hashLegacy(projectDir), getWorktreeSuffix(projectDir), ".db");
 }
 
 /**
@@ -270,10 +310,9 @@ export function getSessionDBPath(opts = CLAUDE_OPTS, projectDirOverride) {
  */
 export function getSessionEventsPath(opts = CLAUDE_OPTS, projectDirOverride) {
   const projectDir = normalizeWorktreePath(projectDirOverride ?? getProjectDir(opts));
-  const hash = createHash("sha256").update(projectDir).digest("hex").slice(0, 16);
   const dir = join(resolveConfigDir(opts), "context-mode", "sessions");
   mkdirSync(dir, { recursive: true });
-  return join(dir, `${hash}${getWorktreeSuffix(projectDir)}-events.md`);
+  return migrateAndJoin(dir, hashCanonical(projectDir), hashLegacy(projectDir), getWorktreeSuffix(projectDir), "-events.md");
 }
 
 /**
@@ -283,8 +322,7 @@ export function getSessionEventsPath(opts = CLAUDE_OPTS, projectDirOverride) {
  */
 export function getCleanupFlagPath(opts = CLAUDE_OPTS, projectDirOverride) {
   const projectDir = normalizeWorktreePath(projectDirOverride ?? getProjectDir(opts));
-  const hash = createHash("sha256").update(projectDir).digest("hex").slice(0, 16);
   const dir = join(resolveConfigDir(opts), "context-mode", "sessions");
   mkdirSync(dir, { recursive: true });
-  return join(dir, `${hash}${getWorktreeSuffix(projectDir)}.cleanup`);
+  return migrateAndJoin(dir, hashCanonical(projectDir), hashLegacy(projectDir), getWorktreeSuffix(projectDir), ".cleanup");
 }

@@ -16,6 +16,11 @@ import { createHash } from "node:crypto";
 
 import { loadDatabase } from "../../src/db-base.js";
 
+
+const _hashCanonical = (p: string) => createHash("sha256").update(
+  (process.platform === "darwin" || process.platform === "win32") ? p.toLowerCase() : p
+).digest("hex").slice(0, 16);
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PRETOOL_PATH = join(__dirname, "..", "..", "hooks", "pretooluse.mjs");
 const POSTTOOL_PATH = join(__dirname, "..", "..", "hooks", "posttooluse.mjs");
@@ -67,7 +72,7 @@ describe("D2 Phase 4 — webfetch-redirected marker pattern", () => {
     // Hooks hash the path AFTER normalizeWorktreePath() (\ → /), so the test
     // must apply the same normalization before SHA — otherwise on Windows the
     // expected hash uses backslashes while the hook uses slashes (#435 pattern).
-    const projectHash = createHash("sha256").update(fakeProject.replace(/\\/g, "/")).digest("hex").slice(0, 16);
+    const projectHash = _hashCanonical(fakeProject.replace(/\\/g, "/"));
     const dbDir = join(fakeHome, ".claude", "context-mode", "sessions");
     mkdirSync(dbDir, { recursive: true });
     dbPath = join(dbDir, `${projectHash}.db`);

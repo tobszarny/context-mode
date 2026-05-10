@@ -34,6 +34,11 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import Database from "better-sqlite3";
 
+
+const _hashCanonical = (p: string) => createHash("sha256").update(
+  (process.platform === "darwin" || process.platform === "win32") ? p.toLowerCase() : p
+).digest("hex").slice(0, 16);
+
 const STATUSLINE = resolve(process.cwd(), "bin", "statusline.mjs");
 
 function runStatusline(env: Record<string, string>) {
@@ -222,7 +227,7 @@ describe("statusline.mjs — multi-adapter aggregation", () => {
   function seedRealAdapter(sessionsDir: string, projectSeed: string) {
     // 200 events across 6 distinct project_dirs, recent created_at, avg bytes ~256.
     // Crosses the isReal filter at analytics.ts:1300-1304.
-    const dbPath = join(sessionsDir, `${createHash("sha256").update(projectSeed).digest("hex").slice(0, 16)}.db`);
+    const dbPath = join(sessionsDir, `${_hashCanonical(projectSeed)}.db`);
     const db = new Database(dbPath);
     db.exec(`
       CREATE TABLE IF NOT EXISTS session_events (

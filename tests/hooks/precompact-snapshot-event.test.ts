@@ -14,9 +14,15 @@ import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
+import { createHash } from "node:crypto";
 
 import { SessionDB } from "../../src/session/db.js";
 import { loadDatabase } from "../../src/db-base.js";
+
+
+const _hashCanonical = (p: string) => createHash("sha256").update(
+  (process.platform === "darwin" || process.platform === "win32") ? p.toLowerCase() : p
+).digest("hex").slice(0, 16);
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PRECOMPACT_PATH = join(__dirname, "..", "..", "hooks", "precompact.mjs");
@@ -75,7 +81,7 @@ describe("precompact.mjs — snapshot-built event (D2 PRD Phase 6.1)", () => {
     // Hooks hash the path AFTER normalizeWorktreePath() (\ → /), so the test
     // must apply the same normalization before SHA — otherwise on Windows the
     // expected hash uses backslashes while the hook uses slashes (#435 pattern).
-    const projectHash = createHash("sha256").update(fakeProject.replace(/\\/g, "/")).digest("hex").slice(0, 16);
+    const projectHash = _hashCanonical(fakeProject.replace(/\\/g, "/"));
     const dbDir = join(fakeHome, ".claude", "context-mode", "sessions");
     require("node:fs").mkdirSync(dbDir, { recursive: true });
     const dbPath = join(dbDir, `${projectHash}.db`);

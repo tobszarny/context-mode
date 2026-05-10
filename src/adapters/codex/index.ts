@@ -22,12 +22,11 @@ import {
   constants,
   mkdirSync,
 } from "node:fs";
-import { createHash } from "node:crypto";
 import { resolve, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { BaseAdapter } from "../base.js";
-import { getWorktreeSuffix, normalizeWorktreePath } from "../../session/db.js";
+import { getWorktreeSuffix, hashProjectDirCanonical, normalizeWorktreePath, resolveSessionDbPath } from "../../session/db.js";
 import { resolveCodexConfigDir } from "./paths.js";
 
 import {
@@ -314,15 +313,18 @@ export class CodexAdapter extends BaseAdapter implements HookAdapter {
   }
 
   getSessionDBPath(projectDir: string): string {
-    const normalized = normalizeWorktreePath(projectDir);
-    const hash = createHash("sha256").update(normalized).digest("hex").slice(0, 16);
-    return join(this.getSessionDir(), `${hash}${getWorktreeSuffix(normalized)}.db`);
+    return resolveSessionDbPath({
+      projectDir: normalizeWorktreePath(projectDir),
+      sessionsDir: this.getSessionDir(),
+    });
   }
 
   getSessionEventsPath(projectDir: string): string {
     const normalized = normalizeWorktreePath(projectDir);
-    const hash = createHash("sha256").update(normalized).digest("hex").slice(0, 16);
-    return join(this.getSessionDir(), `${hash}${getWorktreeSuffix(normalized)}-events.md`);
+    return join(
+      this.getSessionDir(),
+      `${hashProjectDirCanonical(normalized)}${getWorktreeSuffix(normalized)}-events.md`,
+    );
   }
 
   getInstructionFiles(): string[] {

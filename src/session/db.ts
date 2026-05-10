@@ -12,7 +12,8 @@ import type { SessionEvent } from "../types.js";
 import type { ProjectAttribution } from "./project-attribution.js";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { realpathSync } from "node:fs";
+import { existsSync, realpathSync, renameSync } from "node:fs";
+import { join } from "node:path";
 
 // ─────────────────────────────────────────────────────────
 // Worktree isolation
@@ -123,6 +124,88 @@ export function getWorktreeSuffix(projectDir = process.cwd()): string {
 // Test-only helper: clear the memoization between cases.
 export function _resetWorktreeSuffixCacheForTests(): void {
   _wtCache = undefined;
+}
+
+// ─────────────────────────────────────────────────────────
+// SessionDB path resolution + case-fold migration
+// ─────────────────────────────────────────────────────────
+
+/**
+ * Hash a project directory the way the deployed code (≤ v1.0.111) did:
+ * normalize slashes only, preserve raw casing. Kept exported so the
+ * migration helper can locate pre-fix DB files for one-shot rename.
+ *
+ * Do NOT call this for new code paths — use {@link hashProjectDirCanonical}.
+ */
+export function hashProjectDirLegacy(projectDir: string): string {
+  return createHash("sha256")
+    .update(normalizeWorktreePath(projectDir))
+    .digest("hex")
+    .slice(0, 16);
+}
+
+/**
+ * Hash a project directory case-stably. On case-insensitive filesystems
+ * (macOS HFS+/APFS, Windows NTFS) the path is lowercased so that
+ * `/Users/Mert/proj` and `/users/mert/proj` resolve to the same DB file.
+ * On Linux (case-sensitive) casing is preserved.
+ *
+ * Used as the base half of the SessionDB filename:
+ *   <baseHash><worktreeSuffix>.db
+ */
+export function hashProjectDirCanonical(projectDir: string): string {
+  const normalized = normalizeWorktreePath(projectDir);
+  const folded = (process.platform === "darwin" || process.platform === "win32")
+    ? normalized.toLowerCase()
+    : normalized;
+  return createHash("sha256").update(folded).digest("hex").slice(0, 16);
+}
+
+/**
+ * Resolve the SessionDB file path for a project, performing a one-shot
+ * migration from legacy raw-casing filenames to canonical ones when only
+ * the legacy file exists.
+ *
+ * Migration rules:
+ *   - Linux: `legacyHash === canonicalHash` so the resolver short-circuits;
+ *     no migration ever runs (case-sensitive FS, never any drift).
+ *   - macOS / Windows: if the canonical path does not exist but a legacy
+ *     path does, rename in place. This preserves the user's session
+ *     history across the casing-fix upgrade.
+ *   - When BOTH paths exist (rare — usually only if the user previously
+ *     ran two terminals with different casing) the legacy file is left
+ *     UNTOUCHED. The canonical path wins; manual reconciliation needed.
+ *     Avoiding the rename here is the data-loss safety guarantee.
+ *
+ * Worktree separation is preserved: each call only ever migrates the ONE
+ * legacy file matching THIS projectDir's hash. Different worktrees have
+ * different physical paths → different hashes → different DB files; the
+ * migration cannot collapse worktrees.
+ */
+export function resolveSessionDbPath(opts: {
+  projectDir: string;
+  sessionsDir: string;
+}): string {
+  const { projectDir, sessionsDir } = opts;
+  const suffix = getWorktreeSuffix(projectDir);
+  const canonicalHash = hashProjectDirCanonical(projectDir);
+  const canonicalPath = join(sessionsDir, `${canonicalHash}${suffix}.db`);
+
+  if (existsSync(canonicalPath)) return canonicalPath;
+
+  const legacyHash = hashProjectDirLegacy(projectDir);
+  if (legacyHash === canonicalHash) return canonicalPath; // Linux or already canonical
+
+  const legacyPath = join(sessionsDir, `${legacyHash}${suffix}.db`);
+  if (existsSync(legacyPath)) {
+    try {
+      renameSync(legacyPath, canonicalPath);
+    } catch {
+      // Race or permission issue — caller will create canonicalPath on first
+      // write. Better to lose this rename than to throw and break ctx_stats.
+    }
+  }
+  return canonicalPath;
 }
 
 // ─────────────────────────────────────────────────────────

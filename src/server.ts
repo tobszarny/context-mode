@@ -29,7 +29,7 @@ import {
 } from "./runtime.js";
 import { classifyNonZeroExit } from "./exit-classify.js";
 import { startLifecycleGuard } from "./lifecycle.js";
-import { getWorktreeSuffix, SessionDB } from "./session/db.js";
+import { getWorktreeSuffix, hashProjectDirCanonical, hashProjectDirLegacy, resolveSessionDbPath, SessionDB } from "./session/db.js";
 import {
   emitCacheHitEvent,
   emitIndexWriteEvent,
@@ -239,17 +239,17 @@ function hashProjectDir(projectDir = getProjectDir()): string {
 }
 
 /**
- * Resolve the per-project SessionDB path the way 4742160 originally did
- * for `persistToolCallCounter`. Centralized so the write-back, the
- * restore-on-startup, and any future SessionDB consumer all hash to the
- * same file under worktree isolation.
+ * Resolve the per-project SessionDB path. Delegates to
+ * {@link resolveSessionDbPath} so casing-only variants of the same
+ * physical worktree on macOS / Windows hit ONE DB, not two — and any
+ * pre-existing legacy raw-casing DB gets migrated in place on first
+ * resolve. Linux is a no-op.
  */
 function getSessionDbPath(): string {
-  const projectDir = getProjectDir();
-  return join(
-    getSessionDir(),
-    `${hashProjectDir(projectDir)}${getWorktreeSuffix(projectDir)}.db`,
-  );
+  return resolveSessionDbPath({
+    projectDir: getProjectDir(),
+    sessionsDir: getSessionDir(),
+  });
 }
 
 /**
@@ -1764,7 +1764,7 @@ server.registerTool(
         try {
           const sessionsDir = getSessionDir();
           const projectDir = getProjectDir();
-          const dbFile = join(sessionsDir, `${hashProjectDir(projectDir)}${getWorktreeSuffix(projectDir)}.db`);
+          const dbFile = resolveSessionDbPath({ projectDir, sessionsDir });
           if (existsSync(dbFile)) {
             timelineDB = new SessionDB({ dbPath: dbFile });
           }
@@ -2809,12 +2809,15 @@ server.registerTool(
     let text: string;
     try {
       const projectDir = getProjectDir();
-      const dbHash = hashProjectDir(projectDir);
-      const worktreeSuffix = getWorktreeSuffix(projectDir);
-      const sessionDbPath = join(
-        getSessionDir(),
-        `${dbHash}${worktreeSuffix}.db`
-      );
+      // Canonical hash + migration-aware path. The downstream
+      // getConversationStats / getRealBytesStats reconstruct the DB
+      // filename from worktreeHash; pass the SAME canonical hash that
+      // resolveSessionDbPath used so they hit the same file.
+      const dbHash = hashProjectDirCanonical(projectDir);
+      const sessionDbPath = resolveSessionDbPath({
+        projectDir,
+        sessionsDir: getSessionDir(),
+      });
 
       if (existsSync(sessionDbPath)) {
         const Database = loadDatabase();
@@ -3159,27 +3162,31 @@ server.registerTool(
       }
     } catch { /* best effort */ }
 
-    // 3. Wipe session events DB (analytics, metadata, resume snapshots)
+    // 3. Wipe session events DB (analytics, metadata, resume snapshots).
+    // Wipe BOTH canonical and legacy raw-casing filenames so a partial
+    // upgrade leaves no orphaned DB behind on case-insensitive FS.
     try {
       const projectDir = getProjectDir();
-      const dbHash = hashProjectDir(projectDir);
       const worktreeSuffix = getWorktreeSuffix(projectDir);
       const sessDir = getSessionDir();
-      const sessDbPath = join(sessDir, `${dbHash}${worktreeSuffix}.db`);
-      const eventsPath = join(sessDir, `${dbHash}${worktreeSuffix}-events.md`);
-      const cleanupFlag = join(sessDir, `${dbHash}${worktreeSuffix}.cleanup`);
+      const canonicalHash = hashProjectDirCanonical(projectDir);
+      const legacyHash = hashProjectDirLegacy(projectDir);
+      const hashes = canonicalHash === legacyHash ? [canonicalHash] : [canonicalHash, legacyHash];
 
       let sessDbFound = false;
-      for (const suffix of ["", "-wal", "-shm"]) {
-        try { unlinkSync(sessDbPath + suffix); sessDbFound = true; } catch { /* ignore */ }
+      let eventsFound = false;
+      for (const h of hashes) {
+        const sessDbPath = join(sessDir, `${h}${worktreeSuffix}.db`);
+        const eventsPath = join(sessDir, `${h}${worktreeSuffix}-events.md`);
+        const cleanupFlag = join(sessDir, `${h}${worktreeSuffix}.cleanup`);
+        for (const suffix of ["", "-wal", "-shm"]) {
+          try { unlinkSync(sessDbPath + suffix); sessDbFound = true; } catch { /* ignore */ }
+        }
+        try { unlinkSync(eventsPath); eventsFound = true; } catch { /* ignore */ }
+        try { unlinkSync(cleanupFlag); } catch { /* ignore */ }
       }
       if (sessDbFound) deleted.push("session events DB");
-
-      let eventsFound = false;
-      try { unlinkSync(eventsPath); eventsFound = true; } catch { /* ignore */ }
       if (eventsFound) deleted.push("session events markdown");
-
-      try { unlinkSync(cleanupFlag); } catch { /* ignore */ }
     } catch { /* best effort */ }
 
     // 3. Reset in-memory session stats
