@@ -1389,6 +1389,52 @@ function formatDuration(uptimeMin: string): string {
   return m > 0 ? `${h}h ${m}m` : `${h}h`;
 }
 
+/**
+ * Render a UTC ms timestamp as a human-readable local datetime string in
+ * the canonical Mert-approved format:
+ *
+ *   "28 Apr 2026 at 12:16 (Europe/Istanbul)"
+ *
+ * Used by the 5-section narrative renderer (formatReport) so users see
+ * exactly when their conversation started + when /compact rescues fired
+ * in their wall-clock timezone — never UTC, never ambiguous.
+ *
+ * - 24-hour clock with zero-padded minutes ("20:54", not "8:54 PM").
+ * - Day is NOT zero-padded ("9 May", not "09 May") to match the target.
+ * - IANA timezone is appended verbatim in parentheses regardless of
+ *   locale so users never misread Istanbul-time as UTC.
+ * - Returns "" for ms === 0 or NaN so callers can guard the rendered
+ *   line ("started …") without an extra timestamp-validity check.
+ */
+export function formatLocalDateTime(ms: number, locale: string, tz: string): string {
+  if (!Number.isFinite(ms) || ms <= 0) return "";
+  const date = new Date(ms);
+  if (Number.isNaN(date.getTime())) return "";
+  // Intl.DateTimeFormat's "day"/"month"/"year" parts give us the locale's
+  // ordering (en-* → "DD MMM YYYY"), and the explicit numeric hour/minute
+  // forces 24-hour with leading zero on minute when in en-* with hour12=false.
+  const dt = new Intl.DateTimeFormat(locale, {
+    timeZone: tz,
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(date);
+  const get = (type: Intl.DateTimeFormatPartTypes): string =>
+    dt.find((p) => p.type === type)?.value ?? "";
+  const day   = get("day");
+  const month = get("month");
+  const year  = get("year");
+  let hour    = get("hour");
+  const min   = get("minute");
+  // Some locales / some Node versions emit "24" for midnight under hour12=false.
+  // Coerce back to "00" so the displayed time is always wall-clock-correct.
+  if (hour === "24") hour = "00";
+  return `${day} ${month} ${year} at ${hour}:${min} (${tz})`;
+}
+
 /** Format large numbers with K/M suffixes */
 function fmtNum(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
