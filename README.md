@@ -851,25 +851,63 @@ Full configs: [`configs/kiro/mcp.json`](configs/kiro/mcp.json) | [`configs/kiro/
 
 **Prerequisites:** Node.js 18+, Oh My Pi installed.
 
-**Install (recommended — plugin path):**
+**Install — plugin path (recommended):**
 
-```bash
-omp plugin install context-mode
-```
+1. Run the OMP plugin install:
 
-What this does, verified against [`oh-my-pi/packages/coding-agent/src/extensibility/plugins/manager.ts:158`](https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/src/extensibility/plugins/manager.ts):
+   ```bash
+   omp plugin install context-mode
+   ```
 
-1. OMP runs `bun install context-mode` inside `~/.omp/plugins/`
-2. OMP reads `package.json` of the installed package and looks for an `omp` (or `pi`) field — see [`extensibility/plugins/loader.ts:75`](https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/src/extensibility/plugins/loader.ts) — `const manifest = pluginPkg.omp || pluginPkg.pi;`
-3. Our [`package.json`](package.json) declares `"omp": { "hooks": "./build/adapters/omp/plugin.js" }`
-4. OMP imports the file, calls its default export with `HookAPI`
-5. Four handlers register: `session_start`, `tool_call`, `tool_result`, `session_before_compact`
+2. Restart OMP.
 
-The `tool_call` handler returns `{ block: true, reason }` for `curl`/`wget`/inline-fetch in `bash` per [`hooks/types.ts:566`](https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/src/extensibility/hooks/types.ts) (`ToolCallEventResult`). No `mcp.json` edits needed.
+3. Verify:
 
-**Alternative — MCP-only path:**
+   ```bash
+   omp plugin list
+   omp plugin doctor
+   ```
 
-1. `npm install -g context-mode`
+   Both should show `context-mode` as `enabled`.
+
+**Install — manual plugin path (if `omp plugin install` is unavailable):**
+
+OMP plugins live in `~/.omp/plugins/`. Add `context-mode` directly:
+
+1. Install into the OMP plugins workspace:
+
+   ```bash
+   cd ~/.omp/plugins
+   bun add context-mode    # or: npm install context-mode
+   ```
+
+2. Tell OMP the plugin is enabled by editing `~/.omp/plugins/omp-plugins.lock.json` (create the file if missing):
+
+   ```json
+   {
+     "plugins": {
+       "context-mode": {
+         "version": "1.0.111",
+         "enabledFeatures": null,
+         "enabled": true
+       }
+     },
+     "settings": {}
+   }
+   ```
+
+3. Restart OMP.
+
+This is exactly what `omp plugin install` does internally — see upstream [`extensibility/plugins/manager.ts:158`](https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/src/extensibility/plugins/manager.ts) (`bun install` into `getPluginsDir()`) and [`types.ts:141`](https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/src/extensibility/plugins/types.ts) (`PluginRuntimeConfig` shape stored in `omp-plugins.lock.json`).
+
+**Install — MCP-only path (no plugin):**
+
+1. Install context-mode globally:
+
+   ```bash
+   npm install -g context-mode
+   ```
+
 2. Add to `~/.omp/agent/mcp.json` (user scope) or `<project>/.omp/mcp.json` (project scope):
 
    ```json
@@ -892,9 +930,9 @@ The `tool_call` handler returns `{ block: true, reason }` for `curl`/`wget`/inli
 
 4. Restart OMP.
 
-**Verify:** In an OMP session, type `ctx stats`. Context-mode tools should appear and respond. The plugin install can also be checked with `omp plugin doctor` or `omp plugin list`.
+**Verify (any path):** In an OMP session, type `ctx stats`. Context-mode tools should appear and respond.
 
-**Routing:** Plugin path — programmatic enforcement via `pi.on("tool_call", ...)` returning `{ block: true, reason }` (~98% compliance, like Claude Code). MCP-only path — rule-based via `SYSTEM.md` (~60%). Auto-detected via `PI_CODING_AGENT_DIR` env var or presence of `~/.omp/`. Storage roots at `~/.omp/context-mode/` so OMP and Pi installs never share session DBs, content indices, or stats files.
+**Routing:** Plugin path — programmatic enforcement via four `pi.on(...)` handlers (`tool_call` returns `{ block: true, reason }` for `curl`/`wget`/inline-fetch per upstream [`hooks/types.ts:566`](https://github.com/can1357/oh-my-pi/blob/main/packages/coding-agent/src/extensibility/hooks/types.ts), `tool_result` captures session events, `session_start` initializes the per-session DB row, `session_before_compact` persists a resume snapshot). ~98% compliance, parity with Claude Code hooks. MCP-only path — rule-based via `SYSTEM.md`, ~60% compliance. Auto-detected via `PI_CODING_AGENT_DIR` env var or presence of `~/.omp/`. Storage roots at `~/.omp/context-mode/` so OMP and Pi installs never share session DBs, content indices, or stats files.
 
 Full configs: [`configs/omp/mcp.json`](configs/omp/mcp.json) | [`configs/omp/SYSTEM.md`](configs/omp/SYSTEM.md) | plugin source: [`src/adapters/omp/plugin.ts`](src/adapters/omp/plugin.ts)
 
