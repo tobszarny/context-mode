@@ -148,6 +148,33 @@ describe("formatReport — Bugs #5/#6/#7/#8", () => {
     expect(projectBar.length).toBeGreaterThan(referenceBar.length);
   });
 
+  // ── Slice 5: ALL categories render — no "+ N more" tease (Mert: honest,
+  // no tease). This applies to BOTH the narrative section 2 and the legacy
+  // active-session renderProjectMemory path so a screenshot never hides
+  // categories the user actually has.
+  test("renderProjectMemory shows all categories without truncation tease", () => {
+    // 20 categories — far above the legacy topN=15 cap. None should be hidden.
+    const cats: FullReport["projectMemory"]["by_category"] = Array.from(
+      { length: 20 },
+      (_, i) => ({
+        category: `c${i}`,
+        count: 100 - i,
+        label: `Label ${i}`,
+      }),
+    );
+    const report: FullReport = {
+      ...baseReport(),
+      projectMemory: { ...baseReport().projectMemory, by_category: cats },
+    };
+    const text = formatReport(report, "1.0.111", null, {
+      lifetime: { ...emptyLifetime(), totalEvents: 1000, totalSessions: 10 },
+    });
+    // Must NOT emit any "+ N more categor[y/ies]" tease.
+    expect(text).not.toMatch(/\d+ more categor/);
+    // Every label must appear in the rendered output.
+    for (const c of cats) expect(text).toContain(c.label);
+  });
+
   // ── Slice 4 (5-section narrative): formatReport must produce the
   // Mert-approved "kitap gibi" 5-section layout when conversation +
   // realBytes + multiAdapter are all present. Pin the section headers

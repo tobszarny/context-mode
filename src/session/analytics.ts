@@ -2046,12 +2046,11 @@ function renderProjectMemory(
   ) {
     return [];
   }
-  // Show enough categories that the user can SEE what's actually being
-  // tracked, instead of "Files tracked + Project rules · 21 more" hiding
-  // the storytelling. 15 covers the 14-category-and-below typical case
-  // fully and still keeps the terminal output under one screen height.
-  // (Restored after #424 squash-merge silently reverted the v1.0.111 fix.)
-  const topN = opts?.topN ?? 15;
+  // Slice 5 — Mert: "honest, no tease". Show ALL categories. The legacy
+  // topN cap silently hid real data; users would screenshot a stats card
+  // missing half their work. The opts.topN parameter stays in the signature
+  // for back-compat with any external caller that explicitly passes a cap.
+  const topN = opts?.topN ?? Number.POSITIVE_INFINITY;
   const out: string[] = [];
   out.push("");
   // Header switches based on whether we have rich lifetime data from the new
