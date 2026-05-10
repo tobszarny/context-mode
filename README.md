@@ -48,7 +48,7 @@ Context Mode is an MCP server that solves all four sides of this problem:
      files.forEach(f => console.log(f + ': ' + fs.readFileSync('src/'+f,'utf8').split('\\n').length + ' lines'));
    `);
    ```
-4. **Output Compression** — Terse like caveman. Technical substance exact. Only fluff die. Drop articles, filler (just/really/basically), pleasantries, hedging. Fragments OK. Short synonyms. Code unchanged. Pattern: [thing] [action] [reason]. [next step]. Auto-expand for security warnings, irreversible actions, and user confusion. ~65-75% output token reduction with full technical accuracy.
+4. **No prose-style enforcement** — context-mode keeps raw data out of context but never dictates how the model writes its final answer. Brevity, completeness, formatting — your model's call (or yours via your own `CLAUDE.md` / `AGENTS.md`). Aggressive brevity prompts have been shown to degrade coding/reasoning benchmarks ([Moonshot AI on `kimi-k2.5`](https://github.com/anomalyco/opencode/issues/20258)) — the routing block stays focused on *where data goes*, not on *how the model talks*.
 
 <a href="https://www.youtube.com/watch?v=QUHrntlfPo4">
   <picture>

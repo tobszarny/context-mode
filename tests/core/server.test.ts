@@ -1842,7 +1842,16 @@ describe("Hook Injection", () => {
     const parsed = JSON.parse(output);
     const prompt = parsed.hookSpecificOutput.updatedInput.prompt;
     assert.ok(prompt.includes("<output_constraints>"), "Should inject output_constraints");
-    assert.ok(prompt.includes("Terse like caveman"), "Should mention concise communication style");
+    // Pillar 4 (caveman/Output Compression) retired in #482. Routing block
+    // must NOT push a prose-style directive — assert the negative.
+    assert.ok(
+      !prompt.toLowerCase().includes("terse like caveman"),
+      "Routing block must not contain caveman/terse style directive",
+    );
+    assert.ok(
+      !prompt.includes("<communication_style>"),
+      "Routing block must not contain communication_style block",
+    );
     assert.ok(
       prompt.includes("<tool_selection_hierarchy>"),
       "Should inject tool_selection_hierarchy",
@@ -3135,7 +3144,7 @@ describe("ctx_fetch_and_index batch refactor", () => {
 
   test("capped-concurrency note appears only when capped", () => {
     expect(fetchHandlerSrc).toMatch(/cappedNote\s*=\s*capped\s*\?/);
-    // Caveman style — `cap=N/Mcpu` instead of "capped from N to M; M cores available".
+    // Compact form `cap=N/Mcpu` (replaces verbose "capped from N to M; M cores available").
     expect(fetchHandlerSrc).toContain("cap=${effectiveConcurrency}/${cpus().length}cpu");
   });
 
@@ -3156,13 +3165,13 @@ describe("ctx_fetch_and_index batch refactor", () => {
   });
 
   test("batch header uses singular form for count=1 (review F5 plural fix)", () => {
-    // Per CLAUDE.md "Terse like caveman" + grammar correctness:
-    // "1 errors" → "1 error" via the fmt() helper.
+    // Grammar correctness in the compact status line: "1 errors" → "1 error"
+    // via the fmt() helper, so the line stays grammatical at any count.
     expect(fetchHandlerSrc).toContain('const fmt = (n: number, sing: string, plur: string)');
     expect(fetchHandlerSrc).toContain('n === 1 ? sing : plur');
   });
 
-  test("batch header uses caveman style (review F5 terse format)", () => {
+  test("batch header uses compact format (review F5)", () => {
     // Old: "Batch fetched N URLs at concurrency=X (capped from Y to X; Z cores available): a fetched, b cached, c errors. d new sections (eKB total)."
     // New: "fetched N c=X cap=X/Zcpu. ok=a cache=b err=c. d sections eKB."
     expect(fetchHandlerSrc).toContain("`fetched ${batch.length} c=${effectiveConcurrency}");
@@ -4239,5 +4248,44 @@ describe("killProcessOnPort — Windows non-English locale (#441 follow-up)", ()
 
     expect(r.attemptedPids).toEqual([]);
     expect(calls).toHaveLength(1); // netstat only — no taskkill issued
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Prose-style policy (issue #482)
+// ═══════════════════════════════════════════════════════════════════════════
+// Decision: context-mode keeps raw data out of context but does not dictate
+// how the model writes its final answer. Aggressive brevity prompts have been
+// shown to degrade coding/reasoning benchmarks (Moonshot AI on kimi-k2.5).
+// Any caveman/terse-style language in shipped artifacts is a regression.
+
+describe("prose-style policy (#482)", () => {
+  const serverSrc = readFileSync(
+    resolve(__dirname, "../../src/server.ts"),
+    "utf-8",
+  );
+  const routingBlock = readFileSync(
+    resolve(__dirname, "../../hooks/routing-block.mjs"),
+    "utf-8",
+  );
+
+  test("no caveman/terse directive lands in any MCP tool description", () => {
+    expect(serverSrc).not.toMatch(/terse like caveman/i);
+    expect(serverSrc).not.toMatch(/only fluff die/i);
+  });
+
+  test("routing-block has no <communication_style> or <response_format> blocks", () => {
+    expect(routingBlock).not.toMatch(/<communication_style>/);
+    expect(routingBlock).not.toMatch(/<response_format>/);
+    expect(routingBlock).not.toMatch(/terse like caveman/i);
+  });
+
+  test("README does not advertise an Output Compression pillar", () => {
+    const readme = readFileSync(
+      resolve(__dirname, "../../README.md"),
+      "utf-8",
+    );
+    expect(readme).not.toMatch(/\*\*Output Compression\*\*/);
+    expect(readme).not.toMatch(/terse like caveman/i);
   });
 });

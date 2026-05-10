@@ -1007,7 +1007,7 @@ server.registerTool(
   "ctx_execute",
   {
     title: "Execute Code",
-    description: `MANDATORY: Use for any command where output exceeds 20 lines. Execute code in a sandboxed subprocess. Only stdout enters context — raw data stays in the subprocess.${bunNote} Available: ${langList}.\n\nPREFER THIS OVER BASH for: API calls (gh, curl, aws), test runners (npm test, pytest), git queries (git log, git diff), data processing, and ANY CLI command that may produce large output. Bash should only be used for file mutations, git writes, and navigation.\n\nTHINK IN CODE: When you need to analyze, count, filter, compare, or process data — write code that does the work and console.log() only the answer. Do NOT read raw data into context to process mentally. Program the analysis, don't compute it in your reasoning. Write robust, pure JavaScript (no npm dependencies). Use only Node.js built-ins (fs, path, child_process). Always wrap in try/catch. Handle null/undefined. Works on both Node.js and Bun.\n\nWhen reporting results — terse like caveman. Technical substance exact. Only fluff die. Pattern: [thing] [action] [reason]. [next step].`,
+    description: `MANDATORY: Use for any command where output exceeds 20 lines. Execute code in a sandboxed subprocess. Only stdout enters context — raw data stays in the subprocess.${bunNote} Available: ${langList}.\n\nPREFER THIS OVER BASH for: API calls (gh, curl, aws), test runners (npm test, pytest), git queries (git log, git diff), data processing, and ANY CLI command that may produce large output. Bash should only be used for file mutations, git writes, and navigation.\n\nTHINK IN CODE: When you need to analyze, count, filter, compare, or process data — write code that does the work and console.log() only the answer. Do NOT read raw data into context to process mentally. Program the analysis, don't compute it in your reasoning. Write robust, pure JavaScript (no npm dependencies). Use only Node.js built-ins (fs, path, child_process). Always wrap in try/catch. Handle null/undefined. Works on both Node.js and Bun.`,
     inputSchema: z.object({
       language: z
         .enum([
@@ -1337,7 +1337,7 @@ server.registerTool(
   {
     title: "Execute File Processing",
     description:
-      "Read a file and process it without loading contents into context. The file is read into a FILE_CONTENT variable inside the sandbox. Only your printed summary enters context.\n\nPREFER THIS OVER Read/cat for: log files, data files (CSV, JSON, XML), large source files for analysis, and any file where you need to extract specific information rather than read the entire content.\n\nTHINK IN CODE: Write code that processes FILE_CONTENT and console.log() only the answer. Don't read files into context to analyze mentally. Write robust, pure JavaScript — no npm deps, try/catch, null-safe. Node.js + Bun compatible.\n\nWhen reporting results — terse like caveman. Technical substance exact. Only fluff die. Pattern: [thing] [action] [reason]. [next step].",
+      "Read a file and process it without loading contents into context. The file is read into a FILE_CONTENT variable inside the sandbox. Only your printed summary enters context.\n\nPREFER THIS OVER Read/cat for: log files, data files (CSV, JSON, XML), large source files for analysis, and any file where you need to extract specific information rather than read the entire content.\n\nTHINK IN CODE: Write code that processes FILE_CONTENT and console.log() only the answer. Don't read files into context to analyze mentally. Write robust, pure JavaScript — no npm deps, try/catch, null-safe. Node.js + Bun compatible.",
     inputSchema: z.object({
       path: z
         .string()
@@ -1621,8 +1621,7 @@ server.registerTool(
       "Pass ALL search questions as queries array in ONE call. " +
       "File-backed sources are auto-refreshed when the source file changes.\n\n" +
       "TIPS: 2-4 specific terms per query. Use 'source' to scope results.\n\n" +
-      "SESSION STATE: If skills, roles, or decisions were set earlier in this conversation, they are still active. Do not discard or contradict them.\n\n" +
-      "When reporting results — terse like caveman. Technical substance exact. Only fluff die. Pattern: [thing] [action] [reason]. [next step].",
+      "SESSION STATE: If skills, roles, or decisions were set earlier in this conversation, they are still active. Do not discard or contradict them.",
     inputSchema: z.object({
       queries: z.preprocess(coerceJsonArray, z
         .array(z.string())
@@ -2356,8 +2355,7 @@ server.registerTool(
       "  ✅ Use concurrency: 4-8 for: library docs sweep, multi-changelog scan, competitive pricing pages, multi-region docs, GitHub raw file pulls.\n" +
       "  ❌ Single URL → use the legacy {url, source} shape (concurrency irrelevant).\n" +
       "  Example: requests: [{url: 'https://react.dev/...', source: 'react'}, {url: 'https://vuejs.org/...', source: 'vue'}], concurrency: 5.\n" +
-      "  Indexing is serial regardless of concurrency — fetches race, FTS5 writes don't (avoids SQLite WAL contention).\n\n" +
-      "When reporting results — terse like caveman. Technical substance exact. Only fluff die. Pattern: [thing] [action] [reason]. [next step].",
+      "  Fetches parallelize up to your concurrency setting; FTS5 indexing serializes the writes after (SQLite single-writer rule).",
     inputSchema: z.object({
       url: z.string().optional().describe("Single URL to fetch and index (legacy single-shape)"),
       source: z
@@ -2537,8 +2535,8 @@ server.registerTool(
     const cappedNote = capped
       ? ` cap=${effectiveConcurrency}/${cpus().length}cpu`
       : "";
-    // Caveman style — terse status line: counts + sections + size.
-    // Singular forms used at count=1 to avoid grammar drift ("1 errors" → "1 error").
+    // Status line: counts + sections + size, with singular/plural agreement
+    // (count=1 → "1 error" not "1 errors") so the line stays grammatical.
     const fmt = (n: number, sing: string, plur: string) => `${n} ${n === 1 ? sing : plur}`;
     const headerLine =
       `fetched ${batch.length} c=${effectiveConcurrency}${cappedNote}. ` +
@@ -2580,8 +2578,7 @@ server.registerTool(
       "  ❌ Keep concurrency: 1 for: npm test, build, lint, image processing (CPU-bound), or commands sharing state (ports, lock files, same-repo writes).\n" +
       "  Example: [gh issue view 1, gh issue view 2, gh issue view 3] → concurrency: 3.\n" +
       "  Speedup depends on workload — applies to I/O wait, not CPU work.\n\n" +
-      "THINK IN CODE — NON-NEGOTIABLE: When commands produce data you need to analyze, count, filter, compare, or transform — add a processing command that runs JavaScript and console.log() ONLY the answer. NEVER pull raw output into context to reason over. Concurrency parallelizes the FETCH; THINK IN CODE owns the PROCESSING. One programmed analysis replaces ten read-and-reason rounds. Pure JavaScript, Node.js built-ins (fs, path, child_process), try/catch, null-safe.\n\n" +
-      "When reporting results — terse like caveman. Technical substance exact. Only fluff die. Pattern: [thing] [action] [reason]. [next step].",
+      "THINK IN CODE — NON-NEGOTIABLE: When commands produce data you need to analyze, count, filter, compare, or transform — add a processing command that runs JavaScript and console.log() ONLY the answer. NEVER pull raw output into context to reason over. Concurrency parallelizes the FETCH; THINK IN CODE owns the PROCESSING. One programmed analysis replaces ten read-and-reason rounds. Pure JavaScript, Node.js built-ins (fs, path, child_process), try/catch, null-safe.",
     inputSchema: z.object({
       commands: z.preprocess(coerceCommandsArray, z
         .array(

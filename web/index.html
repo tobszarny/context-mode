@@ -297,34 +297,9 @@ code{font-family:var(--mono);font-size:.88em;background:var(--bg-code);color:var
 
 <hr class="sep">
 
-<!-- Ch 4b -->
-<section class="chapter rev">
-  <p class="section-label">Output</p>
-  <h2 class="section-title">Output compression</h2>
-  <div class="rule"></div>
-
-  <p class="body-text">Context saving handles the input side. But the agent wastes output tokens too — filler words, pleasantries, verbose explanations, hedging. "Sure! I'd be happy to help you with that. Let me take a look at the file and see what we can do." That's 30 tokens of nothing.</p>
-
-  <p class="body-text">context-mode enforces output compression across all 15 platforms. Technical substance stays exact. Only fluff dies.</p>
-
-  <div style="background:var(--bg-alt);border:1px solid var(--border-light);border-radius:6px;padding:22px 24px;margin:1.5rem 0">
-    <p style="font-size:15px;color:var(--text);font-weight:600;margin-bottom:10px">The rules</p>
-    <p style="font-size:14px;color:var(--text-2);line-height:1.8;margin:0">Drop: articles, filler (just/really/basically), pleasantries, hedging.<br>Fragments OK. Short synonyms. Code unchanged.<br>Pattern: <code>[thing] [action] [reason]. [next step].</code><br>Auto-expand for: security warnings, irreversible actions, user confusion.</p>
-  </div>
-
-  <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:1.5rem 0">
-    <div style="padding:16px 18px;border:1px solid var(--border-light);border-radius:6px">
-      <p style="font-size:11px;font-weight:600;color:var(--text-4);letter-spacing:.06em;text-transform:uppercase;margin-bottom:8px">Before</p>
-      <p style="font-size:13.5px;color:var(--text-3);line-height:1.6;margin:0;font-style:italic">"Sure, I'd be happy to help! I've looked at the database connection pooling configuration and it appears that the issue is related to the maximum idle timeout setting being set too low for your workload. Let me walk you through the fix."</p>
-    </div>
-    <div style="padding:16px 18px;border:1px solid var(--accent);border-radius:6px;background:var(--accent-light)">
-      <p style="font-size:11px;font-weight:600;color:var(--accent-dark);letter-spacing:.06em;text-transform:uppercase;margin-bottom:8px">After</p>
-      <p style="font-size:13.5px;color:var(--text);line-height:1.6;margin:0">"DB pool idle timeout too low for workload. Set <code>max_idle_ms: 30000</code> in config. Fix:"</p>
-    </div>
-  </div>
-
-  <p class="body-text">~65-75% output token reduction. Full technical accuracy. The agent says the same thing in fewer words. Your context window lasts longer from both sides.</p>
-</section>
+<!-- Ch 4b removed: prose-style enforcement was retired (issue #482).
+     context-mode now keeps raw data out of context but does not dictate
+     how the model writes its final answer. -->
 
 <hr class="sep">
 
