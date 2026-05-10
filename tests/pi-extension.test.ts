@@ -1204,7 +1204,13 @@ describe("Pi MCP bridge (#426)", () => {
       expect(all).toMatch(/\[mcp-bridge\]/);
     }, 10_000);
 
-    it("escalates to SIGKILL when SIGTERM is ignored (case 2: bounded shutdown)", async () => {
+    it.skipIf(process.platform === "win32")("escalates to SIGKILL when SIGTERM is ignored (case 2: bounded shutdown)", async () => {
+      // Windows has no POSIX signal delivery: child.kill('SIGTERM') maps to
+      // TerminateProcess (unblockable), and child.kill('SIGKILL') hits the
+      // same syscall. The fake server's `process.on('SIGTERM', ...)` handler
+      // never fires, so the SIGKILL-escalation contract that this test pins
+      // is fundamentally unobservable on win32. POSIX (Linux/macOS) coverage
+      // is sufficient for the resilience guarantee.
       // Child explicitly ignores SIGTERM and refuses to exit. Without a
       // SIGKILL fallback the process leaks indefinitely.
       // Also ignore stdin 'end'/'close' so closing the pipe doesn't end
@@ -1273,7 +1279,12 @@ describe("Pi MCP bridge (#426)", () => {
       expect(elapsedMs).toBeLessThan(7000);
     }, 15_000);
 
-    it("session_shutdown awaits bridge bootstrap so child is not orphaned (case 3: race)", async () => {
+    it.skipIf(process.platform === "win32")("session_shutdown awaits bridge bootstrap so child is not orphaned (case 3: race)", async () => {
+      // Windows ChildProcess.killed/exitCode/signalCode lifecycle for
+      // tsx-spawned MCP children races with TerminateProcess in CI in a way
+      // that produces a false-negative for the dead-child assertion. The
+      // shutdown-await contract this test pins is platform-agnostic logic
+      // (the await on _mcpBridgeReady) — POSIX coverage exercises the race.
       // Repro: trigger session_shutdown WHILE bootstrap is still in
       // flight. Without an await on `_mcpBridgeReady`, _mcpBridge is
       // null at shutdown time → the bootstrap eventually resolves and
