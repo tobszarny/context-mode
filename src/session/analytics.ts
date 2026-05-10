@@ -1390,6 +1390,87 @@ function formatDuration(uptimeMin: string): string {
 }
 
 /**
+ * Render the section-4 "For example: what would that cost?" block.
+ *
+ * Translates a lifetime token total into a relatable Opus-4 dollar figure
+ * + 3 tangible comparisons (Cursor Pro / Claude Max / weekends of API
+ * coding) + 10-dev team scale projection + alternate-model scale row,
+ * capped with an EXAMPLES disclaimer. The renderer is intentionally
+ * liberal with rounding (whole-month Cursor counts, integer weekends)
+ * because this section is illustrative — the EXAMPLES line tells users
+ * not to confuse it for a bill.
+ *
+ * Returns [] when there's nothing to scale (lifetimeTokens === 0) so
+ * the section disappears cleanly on a fresh install.
+ *
+ * Math constants:
+ *   Opus 4   = $15.00 per 1M input tokens (matches OPUS_INPUT_PRICE_PER_TOKEN)
+ *   Sonnet 4 = $3.00  per 1M input tokens
+ *   GPT-4o   = $2.50  per 1M input tokens
+ *   Gemini 2 = $1.25  per 1M input tokens
+ *   Haiku 4  = $0.80  per 1M input tokens
+ *   Cursor Pro       = $20  / month  → "X months of Cursor Pro"
+ *   Claude Max       = $200 / month  → "X.X months of Claude Max"
+ *   Weekend coding   ≈ $73.67        → "X weekends of nonstop API coding"
+ *   Team multiplier  = 10×           → "At a 10-dev team scale: ~$X over Y days, or ~$Z/year"
+ */
+export function renderCostExample(
+  lifetimeBytes: number,
+  lifetimeTokens: number,
+  lifetimeDays: number,
+): string[] {
+  if (!Number.isFinite(lifetimeTokens) || lifetimeTokens <= 0) return [];
+
+  const opusUsd = (lifetimeTokens * 15) / 1_000_000;
+  const usdStr  = (n: number, dp: number = 2): string => n.toFixed(dp);
+
+  // Comparison units — kept locally so they're easy to tune without touching
+  // the renderer logic. Cursor Pro & Claude Max are public list prices; the
+  // weekend constant is an intentional approximation calibrated to make
+  // $1399.73 → "19 weekends" line up with the demo target.
+  const cursorMonths     = Math.round(opusUsd / 20);
+  const claudeMaxMonths  = (opusUsd / 200).toFixed(1);
+  const weekendCount     = Math.round(opusUsd / 73.67);
+  const teamUsd          = Math.round(opusUsd * 10);
+  const teamYearUsd      = lifetimeDays > 0
+    ? Math.round((opusUsd * 10) / lifetimeDays * 365)
+    : 0;
+
+  // Alternate-model scale row — same token count, different per-1M rates.
+  const sonnetUsd = ((lifetimeTokens * 3.0)  / 1_000_000).toFixed(2);
+  const gpt4oUsd  = ((lifetimeTokens * 2.5)  / 1_000_000).toFixed(2);
+  const geminiUsd = ((lifetimeTokens * 1.25) / 1_000_000).toFixed(2);
+  const haikuUsd  = ((lifetimeTokens * 0.8)  / 1_000_000).toFixed(2);
+
+  const out: string[] = [];
+  out.push(
+    `  context-mode kept ${kb(lifetimeBytes)} (${fmtNum(lifetimeTokens)} tokens) out of your AI's context.`,
+  );
+  out.push("  If those tokens had hit Opus 4 ($15 per 1M input):");
+  out.push("");
+  out.push(`    $${usdStr(opusUsd)}  on Opus 4 input alone`);
+  out.push("");
+  out.push("  That's roughly:");
+  out.push(`    ·  ${cursorMonths} months of Cursor Pro ($20/mo)`);
+  out.push(`    ·  ${claudeMaxMonths} months of Claude Max ($200/mo)`);
+  out.push(`    ·  ${weekendCount} weekends of nonstop API coding`);
+  out.push("");
+  out.push(
+    `  At a 10-dev team scale: ~$${teamUsd} over ${lifetimeDays} days, or ~$${teamYearUsd}/year.`,
+  );
+  out.push("");
+  out.push("  Different model? Math scales:");
+  out.push(
+    `    Sonnet 4  $${sonnetUsd}  ·  GPT-4o $${gpt4oUsd}  ·  Gemini 2 $${geminiUsd}  ·  Haiku 4 $${haikuUsd}`,
+  );
+  out.push("");
+  out.push(
+    "  These are EXAMPLES, not your actual bill — your model and rates may differ.",
+  );
+  return out;
+}
+
+/**
  * One day on the horizontal narrative timeline. `ms` is midnight-UTC of
  * the day (caller is responsible for normalising); `count` is captures
  * for that day; `rescueBytes` (when >0) overlays the ◆ /compact glyph.
