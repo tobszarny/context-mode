@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { execFileSync } from "node:child_process";
 import { detectLocaleAndTz } from "../../src/session/analytics.js";
 
 describe("detectLocaleAndTz", () => {
@@ -14,17 +15,30 @@ describe("detectLocaleAndTz", () => {
     }
   });
 
+  // Regression: `require("node:child_process")` inline threw "Dynamic require
+  // not supported" under esbuild's ESM shim, silently falling through to the
+  // LANG fallback. This test reads the macOS AppleLocale itself and asserts
+  // detectLocaleAndTz returns the SAME value — proving the AppleLocale branch
+  // actually executed (and didn't get swallowed by the catch).
   it("on macOS, AppleLocale beats LANG (regression: require() in ESM was throwing)", () => {
     if (process.platform !== "darwin") return;
+
+    let appleLocale: string;
+    try {
+      appleLocale = execFileSync("defaults", ["read", "-g", "AppleLocale"], {
+        encoding: "utf8", timeout: 500,
+      }).trim().replace(/_/g, "-");
+    } catch {
+      return; // sandbox without `defaults` — nothing to assert against
+    }
+    if (!appleLocale) return;
+
     const orig = { lang: process.env.LANG, override: process.env.CONTEXT_MODE_LOCALE };
     delete process.env.CONTEXT_MODE_LOCALE;
-    process.env.LANG = "en_US.UTF-8";
+    process.env.LANG = "xx_XX.UTF-8"; // a value that would lose if AppleLocale wins
     try {
-      // On dev box AppleLocale=en_TR — assert detection actually reached it.
       const { locale } = detectLocaleAndTz();
-      // If require() shim threw, we'd fall through to LANG → "en-US".
-      // With proper top-level import, we get AppleLocale → some "xx-TR" form.
-      expect(locale.endsWith("-TR")).toBe(true);
+      expect(locale).toBe(appleLocale);
     } finally {
       if (orig.lang === undefined) delete process.env.LANG;
       else process.env.LANG = orig.lang;
