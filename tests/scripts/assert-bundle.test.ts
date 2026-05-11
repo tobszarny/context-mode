@@ -46,4 +46,23 @@ describe("assert-bundle script", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("exits 0 on a clean fixture bundle that uses createRequire", () => {
+    const dir = mkdtempSync(join(tmpdir(), "assert-bundle-green-"));
+    const clean = join(dir, "clean.bundle.mjs");
+    // Realistic clean ESM bundle: createRequire at module top, no shim,
+    // no bare `require("node:...")` anywhere.
+    writeFileSync(
+      clean,
+      `import { createRequire } from "node:module";\nconst require2 = createRequire(import.meta.url);\nconst sqlite = require2("better-sqlite3");\nexport { sqlite };\n`,
+      "utf-8",
+    );
+    try {
+      const r = runAssert(clean);
+      expect(r.status).toBe(0);
+      expect(r.stdout).toMatch(/OK/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
