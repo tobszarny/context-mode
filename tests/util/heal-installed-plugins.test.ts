@@ -520,4 +520,28 @@ describe("healPluginJsonMcpServers (Issue #523)", () => {
     expect(readFileSync(pluginJsonPath, "utf-8")).toBe(before);
   });
 
+  // Slice 4 — traversal guard.
+  it("traversal guard — refuses to write outside ~/.claude/plugins/cache", () => {
+    const cacheRoot = makeTmp("ctx-issue523-cache-");
+    // pluginRoot OUTSIDE the declared cache root → must refuse.
+    const escapedRoot = makeTmp("ctx-issue523-escape-");
+    mkdirSync(resolve(escapedRoot, ".claude-plugin"), { recursive: true });
+    const pluginJsonPath = buildPoisonedPluginJson({
+      pluginRoot: escapedRoot,
+      args0: "/var/folders/x/T/context-mode-upgrade-1747000000000/start.mjs",
+    });
+    const before = readFileSync(pluginJsonPath, "utf-8");
+
+    const result = healPluginJsonMcpServers({
+      pluginRoot: escapedRoot,
+      pluginCacheRoot: cacheRoot,
+      pluginKey: "context-mode@context-mode",
+    });
+
+    expect(result.healed).toEqual([]);
+    expect(result.skipped).toBe("outside-cache-root");
+    // File is untouched.
+    expect(readFileSync(pluginJsonPath, "utf-8")).toBe(before);
+  });
+
 });
