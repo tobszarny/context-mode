@@ -276,6 +276,14 @@ describe("Bash structurally-bounded allowlist: extended commands (#517)", () => 
       expect(decision, `expected null for ${command}`).toBeNull();
     }
   });
+
+  it("id / id <user> — no nudge", () => {
+    for (const command of ["id", "id mksglu", "id -u"]) {
+      resetGuidanceThrottle(SID);
+      const decision = routePreToolUse("Bash", { command }, "/test", "claude-code", SID);
+      expect(decision, `expected null for ${command}`).toBeNull();
+    }
+  });
 });
 
 describe("Bash structurally-bounded allowlist: newline injection (#470)", () => {

@@ -160,6 +160,9 @@ const SAFE_COMMAND_PATTERNS = [
   // uname (#517): short-flag probes only (`-a`, `-srm`). No path operands —
   // uname doesn't take any, and refusing them keeps the pattern strict.
   /^uname(?:\s+-[a-zA-Z]+)?$/,
+  // id (#517): bare `id`, single short flag (`-u`, `-g`), or single user
+  // operand (`id mksglu`). Output is one line — bounded by definition.
+  /^id(?:\s+\S+)?$/,
   /^date(?:\s+[^\r\n]+)?$/,
   /^echo\s/,
   /^printf\s/,
