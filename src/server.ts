@@ -3139,21 +3139,37 @@ server.registerTool(
   {
     title: "Purge Knowledge Base",
     description:
-      "Permanently deletes session data for this project. " +
-      "Default (bare {confirm:true}): wipes ALL session data — FTS5 knowledge base, " +
-      "session events DB, session events markdown, and stats. " +
-      "Scoped (sessionId or scope:'session'): wipes ONLY the matching session's rows " +
-      "and FTS5 chunks; sibling sessions and the FTS5 store file are preserved. " +
-      "This is irreversible.",
+      "DESTRUCTIVE — permanently delete indexed content. CANNOT be undone.\n\n" +
+      "You MUST specify exactly ONE scope:\n\n" +
+      "  • { confirm: true, sessionId: \"<uuid>\" }\n" +
+      "      Deletes ONLY that session's events + per-session FTS5 chunks.\n" +
+      "      Preserves stats file and ALL other sessions.\n\n" +
+      "  • { confirm: true, scope: \"project\" }\n" +
+      "      Wipes the ENTIRE project: FTS5 knowledge base, every session DB row,\n" +
+      "      events markdown, AND resets the stats file.\n\n" +
+      "REFUSAL RULES (tool returns an error):\n" +
+      "  • confirm: false                              → 'purge cancelled'\n" +
+      "  • Both sessionId AND scope:'project' provided → 'ambiguous — pick one'\n" +
+      "  • scope:'session' without sessionId           → throws (sessionId required)\n" +
+      "  • Neither sessionId NOR scope provided        → DEPRECATED: maps to\n" +
+      "    scope:'project' with a deprecation warning to stderr. Will be a hard\n" +
+      "    error in a future major.\n\n" +
+      "Use sessionId when the user asks to clear a specific conversation's data.\n" +
+      "Use scope:'project' ONLY when the user explicitly asks to reset everything.\n" +
+      "NEVER call with bare {confirm:true} — always specify the scope.",
     inputSchema: z.object({
-      confirm: z.boolean().describe("Must be true to confirm the destructive operation."),
+      confirm: z.boolean().describe(
+        "MUST be true. Destructive operation; false returns 'purge cancelled'."
+      ),
       sessionId: z.string().optional().describe(
-        "Session id whose rows + FTS5 chunks should be wiped. When provided, " +
-        "implies scope:'session' (project-wide files preserved)."
+        "UUID of a single session. Pairs with confirm:true to wipe only that " +
+        "session's events + per-session FTS5 chunks. Sibling sessions and the " +
+        "stats file are preserved. MUST NOT be combined with scope:'project'."
       ),
       scope: z.enum(["session", "project"]).optional().describe(
-        "Explicit scope. 'session' requires sessionId. 'project' is the legacy " +
-        "destructive whole-project wipe. Omit to infer from sessionId."
+        "Explicit scope selector. 'session' REQUIRES sessionId. 'project' wipes " +
+        "the entire project (FTS5 + every session + stats). Omit only for the " +
+        "deprecated bare-{confirm:true} back-compat path."
       ),
     }).refine(
       (v) => !(v.sessionId && v.scope === "project"),
