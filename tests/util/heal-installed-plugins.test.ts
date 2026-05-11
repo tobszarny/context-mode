@@ -493,4 +493,31 @@ describe("healPluginJsonMcpServers (Issue #523)", () => {
     );
   });
 
+  // Slice 3 — idempotent: leave correct placeholder untouched.
+  it("idempotent — leaves correct ${CLAUDE_PLUGIN_ROOT} placeholder untouched", () => {
+    const cacheRoot = makeTmp("ctx-issue523-cache-");
+    const pluginRoot = resolve(
+      cacheRoot,
+      "context-mode",
+      "context-mode",
+      "1.0.118",
+    );
+    mkdirSync(pluginRoot, { recursive: true });
+    const pluginJsonPath = buildPoisonedPluginJson({
+      pluginRoot,
+      args0: "${CLAUDE_PLUGIN_ROOT}/start.mjs",
+    });
+    const before = readFileSync(pluginJsonPath, "utf-8");
+
+    const result = healPluginJsonMcpServers({
+      pluginRoot,
+      pluginCacheRoot: cacheRoot,
+      pluginKey: "context-mode@context-mode",
+    });
+
+    expect(result.healed).toEqual([]);
+    // Bytes on disk are unchanged.
+    expect(readFileSync(pluginJsonPath, "utf-8")).toBe(before);
+  });
+
 });
