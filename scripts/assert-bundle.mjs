@@ -27,15 +27,15 @@ const FORBIDDEN_PATTERNS = [
   },
   {
     name: "shimmed-node-builtin-call",
-    pattern: /__require\(\s*["']node:/,
+    pattern: /__require\s*\(\s*["'`]\s*node:/,
     reason:
       "Bundle contains a __require('node:...') call site, which routes through the throwing shim. Replace with createRequire(import.meta.url) at module top.",
   },
   {
     name: "raw-bare-require-node-builtin",
-    pattern: /\brequire\(\s*["']node:/,
+    pattern: /\brequire\s*\(\s*["'`]\s*node:/,
     reason:
-      "Bundle contains a bare require('node:...') call. esbuild ESM output cannot resolve this at runtime. Use createRequire(import.meta.url).",
+      "Bundle contains a bare require('node:...') call. esbuild ESM output cannot resolve this at runtime. Use createRequire(import.meta.url). (Pattern catches single, double, and template-literal quote forms with optional whitespace.)",
   },
 ];
 
