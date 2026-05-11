@@ -28,6 +28,10 @@ import {
 } from "./runtime.js";
 import { getHookScriptPaths } from "./util/hook-config.js";
 import { resolveClaudeConfigDir } from "./util/claude-config.js";
+// v1.0.119 — Issue #523 Layer 5 heal: post-bump assertion on .claude-plugin/plugin.json
+// mcpServers args. Single source of truth shared with start.mjs HEAL block + postinstall.
+// @ts-expect-error — JS module, no TS declarations
+import { healPluginJsonMcpServers } from "../scripts/heal-installed-plugins.mjs";
 // Private 16-LOC copy of browserOpenArgv. Canonical version lives in src/server.ts;
 // duplicated here so the cli bundle does not pull server.ts top-level boot side effects.
 // Keep in sync — pure data, no I/O.
@@ -866,6 +870,32 @@ async function upgrade() {
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
         throw new Error(`Registry consistency check failed: ${message}`);
+      }
+
+      // v1.0.119 — Issue #523 — Layer 5 heal: assert .claude-plugin/plugin.json's
+      // mcpServers["context-mode"].args[0] is the literal ${CLAUDE_PLUGIN_ROOT}/start.mjs
+      // placeholder, not a tmpdir-prefixed absolute path. cli.ts already wrote .mcp.json
+      // with the placeholder (#411 fix), but plugin.json was never touched here — and
+      // start.mjs's normalize-hooks (Windows + #378) can bake in absolute paths that
+      // become stale across upgrades. We call the shared heal twice: first call cleans
+      // any drift; second call MUST return healed:[] or we throw. Single source of
+      // truth shared with start.mjs HEAL block + postinstall.
+      try {
+        const pluginCacheRoot = resolve(resolveClaudeConfigDir(), "plugins", "cache");
+        const pluginKey = "context-mode@context-mode";
+        const firstPass = healPluginJsonMcpServers({ pluginRoot, pluginCacheRoot, pluginKey });
+        if (firstPass && firstPass.error) {
+          throw new Error(firstPass.error);
+        }
+        const secondPass = healPluginJsonMcpServers({ pluginRoot, pluginCacheRoot, pluginKey });
+        if (secondPass && Array.isArray(secondPass.healed) && secondPass.healed.length > 0) {
+          throw new Error(
+            `Plugin manifest drift: plugin.json mcpServers.args still poisoned after first heal pass (healed=${secondPass.healed.join(",")})`,
+          );
+        }
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        throw new Error(`plugin.json drift check failed: ${message}`);
       }
 
       // v1.0.114 hotfix — marketplace post-pull assertion: clone (if
