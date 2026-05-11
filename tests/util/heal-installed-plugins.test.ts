@@ -455,4 +455,42 @@ describe("healPluginJsonMcpServers (Issue #523)", () => {
     ]);
   });
 
+  // Slice 2 — epoch-pattern detection works even if the tmpdir still exists.
+  it("rewrites context-mode-upgrade-<digits> path even if currently exists", () => {
+    const cacheRoot = makeTmp("ctx-issue523-cache-");
+    const pluginRoot = resolve(
+      cacheRoot,
+      "context-mode",
+      "context-mode",
+      "1.0.118",
+    );
+    mkdirSync(pluginRoot, { recursive: true });
+    // Faithfully reproduce cli.ts's `context-mode-upgrade-${Date.now()}` —
+    // pure-numeric epoch suffix that mkdtempSync would never produce.
+    const epochTmp = join(
+      tmpdir(),
+      `context-mode-upgrade-${Date.now()}`,
+    );
+    mkdirSync(epochTmp, { recursive: true });
+    cleanups.push(epochTmp);
+    const fakeStart = join(epochTmp, "start.mjs");
+    writeFileSync(fakeStart, "// fake\n");
+    const pluginJsonPath = buildPoisonedPluginJson({
+      pluginRoot,
+      args0: fakeStart,
+    });
+
+    const result = healPluginJsonMcpServers({
+      pluginRoot,
+      pluginCacheRoot: cacheRoot,
+      pluginKey: "context-mode@context-mode",
+    });
+
+    expect(result.healed).toContain("plugin-json-args");
+    const after = JSON.parse(readFileSync(pluginJsonPath, "utf-8"));
+    expect(after.mcpServers["context-mode"].args[0]).toBe(
+      "${CLAUDE_PLUGIN_ROOT}/start.mjs",
+    );
+  });
+
 });
