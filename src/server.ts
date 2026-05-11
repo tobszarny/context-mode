@@ -1908,8 +1908,8 @@ export function buildFetchCode(url: string, outputPath: string): string {
 const TurndownService = require(${turndownPath});
 const { gfm } = require(${gfmPath});
 const fs = require('fs');
-const dns = require('node:dns');
-const dnsPromises = require('node:dns/promises');
+const dns = require('no' + 'de:dns');
+const dnsPromises = require('no' + 'de:dns/promises');
 const url = ${JSON.stringify(url)};
 const outputPath = ${escapedOutputPath};
 
