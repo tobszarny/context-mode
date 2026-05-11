@@ -261,6 +261,23 @@ describe("Bash structurally-bounded allowlist (#463)", () => {
   });
 });
 
+describe("Bash structurally-bounded allowlist: extended commands (#517)", () => {
+  // Issue #517 extends the allowlist with `uname / id / realpath / ln`.
+  // These are short-output system probes / fs ops that were omitted from
+  // the original #463/#470 batch — restoring parity with the documented
+  // "system probes + silent fs ops" buckets.
+  const SID = "issue-517-tests";
+  beforeEach(() => resetGuidanceThrottle(SID));
+
+  it("uname / uname -a — no nudge", () => {
+    for (const command of ["uname", "uname -a", "uname -srm"]) {
+      resetGuidanceThrottle(SID);
+      const decision = routePreToolUse("Bash", { command }, "/test", "claude-code", SID);
+      expect(decision, `expected null for ${command}`).toBeNull();
+    }
+  });
+});
+
 describe("Bash structurally-bounded allowlist: newline injection (#470)", () => {
   // Bash treats newline as a statement separator (equivalent to `;`). A safe
   // first line followed by an unbounded sink on line 2 must NOT be allowlisted —

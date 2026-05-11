@@ -157,6 +157,9 @@ const SAFE_COMMAND_PATTERNS = [
   /^pwd$/,
   /^whoami$/,
   /^hostname(?:\s+-[a-zA-Z]+)?$/,
+  // uname (#517): short-flag probes only (`-a`, `-srm`). No path operands —
+  // uname doesn't take any, and refusing them keeps the pattern strict.
+  /^uname(?:\s+-[a-zA-Z]+)?$/,
   /^date(?:\s+[^\r\n]+)?$/,
   /^echo\s/,
   /^printf\s/,
