@@ -96,6 +96,33 @@ export interface PurgeOpts {
    * session DB hash.
    */
   contentHash?: string;
+  /**
+   * Issue #520 — scoped purge.
+   *
+   *  - `"project"` (default when omitted for back-compat callers that
+   *    only pass `confirm:true` at the MCP layer): wipe ALL session
+   *    artifacts for `projectDir`. This is the legacy destructive
+   *    behavior preserved verbatim.
+   *  - `"session"`: wipe ONLY the rows for `sessionId` inside the
+   *    project's SessionDB plus FTS5 chunks tagged with that
+   *    `session_id`. Project-wide files (events.md, content store
+   *    file, stats file) are left intact. Requires `sessionId`.
+   *
+   * When `scope` is omitted but `sessionId` is set, behavior implies
+   * `scope:"session"` (a sessionId-only call cannot mean "wipe the
+   * whole project"). When neither is set, behavior implies
+   * `scope:"project"` for back-compat with the original handler.
+   */
+  scope?: "session" | "project";
+  /**
+   * Session identifier whose rows should be wiped from the project's
+   * SessionDB and tagged FTS5 chunks. Only consulted when `scope ===
+   * "session"`. The `session_events`, `session_meta`, and
+   * `session_resume` rows for this id are removed; rows for other
+   * sessions in the same DB are preserved. Match SessionDB.deleteSession
+   * semantics (see src/session/db.ts).
+   */
+  sessionId?: string;
 }
 
 export interface PurgeResult {
@@ -147,9 +174,22 @@ function tryUnlinkSqliteTriple(path: string, wipedPaths: string[]): boolean {
  * without `contentHash`), which is a programmer bug not a runtime concern.
  */
 export function purgeSession(opts: PurgeOpts): PurgeResult {
-  const { projectDir, sessionsDir, storePath, contentDir, legacyContentDir, contentHash } = opts;
+  const { projectDir, sessionsDir, storePath, contentDir, legacyContentDir, contentHash, sessionId, scope } = opts;
   const deleted: string[] = [];
   const wipedPaths: string[] = [];
+
+  // Issue #520 — scope discipline.
+  // Resolve effective scope: explicit `scope` wins; otherwise infer
+  // "session" iff sessionId is given, else "project".
+  const effectiveScope: "session" | "project" =
+    scope ?? (sessionId ? "session" : "project");
+
+  if (effectiveScope === "session" && !sessionId) {
+    throw new TypeError(
+      "purgeSession: scope:'session' requires sessionId. " +
+      "Pass scope:'project' for the legacy whole-project wipe."
+    );
+  }
 
   // ── 1. Knowledge base FTS5 store (per-platform). ──────────────────────
   // Two input modes:

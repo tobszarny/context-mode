@@ -445,3 +445,22 @@ describe("purgeSession — slice 9: backward-compatible labels", () => {
     for (const [, n] of Object.entries(counts)) expect(n).toBe(1);
   });
 });
+
+// ─────────────────────────────────────────────────────────
+// Issue #520 — scoped purge slices
+// ─────────────────────────────────────────────────────────
+
+// Slice 1 — explicit scope discipline. Either provide sessionId, or
+// declare scope:"project". Bare scope:"session" with no sessionId is
+// a programmer bug and must throw immediately.
+describe("purgeSession — issue #520 slice 1: requires sessionId for scope:'session'", () => {
+  it("throws TypeError when scope:'session' is passed without sessionId", () => {
+    const projectDir = makeRepo("i520s1");
+    const sessionsDir = makeTmpDir("sess-i520s1");
+    expect(() => purgeSession({
+      projectDir,
+      sessionsDir,
+      scope: "session",
+    })).toThrow(TypeError);
+  });
+});
