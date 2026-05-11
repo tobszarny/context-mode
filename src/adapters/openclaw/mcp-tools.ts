@@ -203,7 +203,12 @@ export const OPENCLAW_TOOL_DEFS: readonly OpenClawToolDef[] = [
   },
   {
     name: "ctx_purge",
-    description: "Permanently delete all indexed content and reset session stats. Destructive.",
+    description:
+      "Permanently delete session data. " +
+      "Default ({confirm:true}, deprecated): wipes ALL indexed content + session DB + stats. " +
+      "Scoped ({confirm:true, sessionId:'<id>'} or scope:'session'): wipes only that session's " +
+      "rows + FTS5 chunks; sibling sessions and project stats preserved. " +
+      "Pass scope:'project' explicitly for the destructive whole-project wipe. Destructive.",
     parameters: {
       type: "object",
       properties: {},
