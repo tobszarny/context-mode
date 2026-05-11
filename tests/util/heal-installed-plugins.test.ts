@@ -30,6 +30,8 @@ import {
   healInstalledPlugins,
   // @ts-expect-error — JS module, no TS declarations
   healSettingsEnabledPlugins,
+  // @ts-expect-error — JS module, no TS declarations
+  healPluginJsonMcpServers,
 } from "../../scripts/heal-installed-plugins.mjs";
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -383,4 +385,74 @@ describe("healSettingsEnabledPlugins (v1.0.116)", () => {
     expect(result.healed).toEqual([]);
     expect(result.skipped).toBe("no-settings");
   });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// healPluginJsonMcpServers — Issue #523 (v1.0.119)
+// /ctx-upgrade in v1.0.118 left ~/.claude/plugins/cache/.../.claude-plugin/
+// plugin.json with mcpServers["context-mode"].args[0] pointing at the
+// upgrade tmpdir (e.g. /var/folders/.../T/context-mode-upgrade-1747000000000/
+// start.mjs). After the temp dir is reaped, MCP fails to spawn with ENOENT
+// and the user has no /ctx-upgrade escape hatch. Sibling of #411 (which
+// fixed .mcp.json only).
+//
+// Layer 5 heal: detect the tmpdir-prefixed args[0] and rewrite it back to
+// the literal `${CLAUDE_PLUGIN_ROOT}/start.mjs` placeholder that survives
+// across upgrades.
+// ─────────────────────────────────────────────────────────────────────────
+
+describe("healPluginJsonMcpServers (Issue #523)", () => {
+  function buildPoisonedPluginJson(opts: {
+    pluginRoot: string;
+    args0: string;
+    extraServers?: Record<string, unknown>;
+  }): string {
+    mkdirSync(resolve(opts.pluginRoot, ".claude-plugin"), { recursive: true });
+    const path = resolve(opts.pluginRoot, ".claude-plugin", "plugin.json");
+    const content = {
+      name: "context-mode",
+      version: "1.0.118",
+      mcpServers: {
+        "context-mode": {
+          command: "node",
+          args: [opts.args0],
+        },
+        ...(opts.extraServers ?? {}),
+      },
+      skills: "./skills/",
+    };
+    writeFileSync(path, JSON.stringify(content, null, 2) + "\n");
+    return path;
+  }
+
+  // Slice 1
+  it("rewrites tmpdir-prefixed args[0] to ${CLAUDE_PLUGIN_ROOT}/start.mjs", () => {
+    const cacheRoot = makeTmp("ctx-issue523-cache-");
+    const pluginRoot = resolve(
+      cacheRoot,
+      "context-mode",
+      "context-mode",
+      "1.0.118",
+    );
+    mkdirSync(pluginRoot, { recursive: true });
+    const poisonedTmp =
+      "/var/folders/xx/yyy/T/context-mode-upgrade-1747000000000";
+    const pluginJsonPath = buildPoisonedPluginJson({
+      pluginRoot,
+      args0: `${poisonedTmp}/start.mjs`,
+    });
+
+    const result = healPluginJsonMcpServers({
+      pluginRoot,
+      pluginCacheRoot: cacheRoot,
+      pluginKey: "context-mode@context-mode",
+    });
+
+    expect(result.healed).toContain("plugin-json-args");
+    const after = JSON.parse(readFileSync(pluginJsonPath, "utf-8"));
+    expect(after.mcpServers["context-mode"].args).toEqual([
+      "${CLAUDE_PLUGIN_ROOT}/start.mjs",
+    ]);
+  });
+
 });
