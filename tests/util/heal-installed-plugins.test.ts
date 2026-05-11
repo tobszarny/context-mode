@@ -544,4 +544,44 @@ describe("healPluginJsonMcpServers (Issue #523)", () => {
     expect(readFileSync(pluginJsonPath, "utf-8")).toBe(before);
   });
 
+  // Slice 5 — preserves unrelated mcpServers entries.
+  it("preserves unrelated mcpServers entries", () => {
+    const cacheRoot = makeTmp("ctx-issue523-cache-");
+    const pluginRoot = resolve(
+      cacheRoot,
+      "context-mode",
+      "context-mode",
+      "1.0.118",
+    );
+    mkdirSync(pluginRoot, { recursive: true });
+    const pluginJsonPath = buildPoisonedPluginJson({
+      pluginRoot,
+      args0: "/tmp/context-mode-upgrade-1747000000000/start.mjs",
+      extraServers: {
+        "user-other-mcp": {
+          command: "python",
+          args: ["/usr/local/bin/other-mcp.py", "--flag"],
+        },
+      },
+    });
+
+    const result = healPluginJsonMcpServers({
+      pluginRoot,
+      pluginCacheRoot: cacheRoot,
+      pluginKey: "context-mode@context-mode",
+    });
+
+    expect(result.healed).toContain("plugin-json-args");
+    const after = JSON.parse(readFileSync(pluginJsonPath, "utf-8"));
+    // Our entry healed.
+    expect(after.mcpServers["context-mode"].args[0]).toBe(
+      "${CLAUDE_PLUGIN_ROOT}/start.mjs",
+    );
+    // Sibling untouched (we don't own it).
+    expect(after.mcpServers["user-other-mcp"]).toEqual({
+      command: "python",
+      args: ["/usr/local/bin/other-mcp.py", "--flag"],
+    });
+  });
+
 });
