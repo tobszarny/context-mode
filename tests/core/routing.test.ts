@@ -293,6 +293,28 @@ describe("Bash structurally-bounded allowlist: extended commands (#517)", () => 
     }
   });
 
+  it("regression guard — operator composition still trips on new commands", () => {
+    // Defense-in-depth (#470): the SHELL_CONTROL_OPERATORS gate must still
+    // disqualify any of the new #517 commands when composed with an
+    // unbounded sink (pipe, redirect, &&, ;, single &, $(...), heredoc-less
+    // command sub, newline injection). Without this gate, an attacker could
+    // wrap a flood behind an allowlisted command (`uname -a | tee
+    // /tmp/leak`).
+    const cases = [
+      "uname -a | tee /tmp/x",
+      "id > /tmp/leak",
+      "realpath /etc/hosts && cat /var/log/syslog",
+      "ln -s a b ; find /",
+      "uname -a\nfind /",
+      "id $(find /)",
+    ];
+    for (const command of cases) {
+      resetGuidanceThrottle(SID);
+      const decision = routePreToolUse("Bash", { command }, "/test", "claude-code", SID);
+      expect(decision?.action, `expected nudge for ${JSON.stringify(command)}`).toBe("context");
+    }
+  });
+
   it("ln -s a b → no nudge; ln -v a b → still nudged (verbose floods)", () => {
     // Mirrors cp/mv/rm discipline (#470 defense): ln is silent on success,
     // but `-v` / `--verbose` prints one line per link — flooding on bulk
