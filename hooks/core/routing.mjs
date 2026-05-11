@@ -172,6 +172,10 @@ const SAFE_COMMAND_PATTERNS = [
   /^readlink(?:\s+[^\r\n]+)?$/,
   /^basename(?:\s+[^\r\n]+)?$/,
   /^dirname(?:\s+[^\r\n]+)?$/,
+  // realpath (#517): canonical path resolution prints one line per operand.
+  // Same shape as readlink — single-line `[^\r\n]+` to mirror the operator-gate
+  // defense-in-depth from #470.
+  /^realpath(?:\s+[^\r\n]+)?$/,
   // Filesystem ops (silent on success, errors on stderr only).
   // For cp / mv / rm we explicitly refuse `-v` / `--verbose`: verbose
   // mode prints one line per file and can flood on big trees

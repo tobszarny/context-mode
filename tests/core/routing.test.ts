@@ -284,6 +284,14 @@ describe("Bash structurally-bounded allowlist: extended commands (#517)", () => 
       expect(decision, `expected null for ${command}`).toBeNull();
     }
   });
+
+  it("realpath ./foo — no nudge", () => {
+    for (const command of ["realpath ./foo", "realpath /etc/hosts", "realpath -s ./bar"]) {
+      resetGuidanceThrottle(SID);
+      const decision = routePreToolUse("Bash", { command }, "/test", "claude-code", SID);
+      expect(decision, `expected null for ${command}`).toBeNull();
+    }
+  });
 });
 
 describe("Bash structurally-bounded allowlist: newline injection (#470)", () => {
