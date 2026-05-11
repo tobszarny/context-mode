@@ -471,7 +471,32 @@ async function doctor(): Promise<number> {
     }
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
-    if (message.includes("Cannot find module") || message.includes("MODULE_NOT_FOUND")) {
+    // Distinguish package-missing from binding-missing (#514). Both
+    // throw with similar shapes from `import("better-sqlite3")` but the
+    // recovery commands differ:
+    //   - package-missing → `npm install better-sqlite3 --no-optional`
+    //     (npm@7+ silently drops optionalDependencies on engine
+    //     mismatch, e.g. Node 26 vs better-sqlite3@12.x — we name the
+    //     package explicitly + flip the optional filter to recover)
+    //   - binding-missing → `npm rebuild better-sqlite3` (#408 flow,
+    //     Windows + missing prebuild-install shim)
+    const pluginRootForDoctor = getPluginRoot();
+    const bsqPackageDir = resolve(pluginRootForDoctor, "node_modules", "better-sqlite3");
+    const packageMissing = !existsSync(bsqPackageDir);
+
+    if (packageMissing) {
+      criticalFails++;
+      p.log.error(
+        color.red("FTS5 / better-sqlite3: FAIL") +
+          color.dim(" — package-missing") +
+          color.dim(
+            `\n  Path: ${bsqPackageDir}` +
+            "\n  Root cause: npm silently skipped better-sqlite3 because the package's `engines` field excluded the running Node (issue #514, e.g. Node 26 vs better-sqlite3@12.x)." +
+            `\n  Try (primary): cd "${pluginRootForDoctor}" && npm install better-sqlite3 --no-optional` +
+            "\n  Try (fallback): /context-mode:ctx-upgrade",
+          ),
+      );
+    } else if (message.includes("Cannot find module") || message.includes("MODULE_NOT_FOUND")) {
       p.log.warn(color.yellow("FTS5 / better-sqlite3: SKIP") + color.dim(" — module not available (restart session after upgrade)"));
     } else {
       criticalFails++;
@@ -939,8 +964,53 @@ async function upgrade() {
               color.dim(`\n  Try manually: cd "${pluginRoot}" && npm rebuild better-sqlite3`),
           );
         }
+
+        // ── Post-install binding verifier (#514) ────────────────────
+        // npm@7+ silently drops optionalDependencies whose engines
+        // field excludes the running Node (e.g. Node 26 vs
+        // better-sqlite3@12.x). On a silent skip the package directory
+        // is missing entirely and ensure-deps cannot recover. Fail
+        // loud so /ctx-upgrade no longer reports success while the
+        // knowledge base is unusable.
+        const bsqBindingPath = resolve(
+          pluginRoot,
+          "node_modules",
+          "better-sqlite3",
+          "build",
+          "Release",
+          "better_sqlite3.node",
+        );
+        if (!existsSync(bsqBindingPath)) {
+          // Try one last self-heal — explicit, named install bypasses
+          // the optionalDependency silent-skip path even if the dep
+          // somehow regressed back to optional.
+          try {
+            const healPath = resolve(pluginRoot, "scripts", "heal-better-sqlite3.mjs");
+            if (existsSync(healPath)) {
+              const mod = await import(
+                `${pathToFileURL(healPath).href}?upgrade=${Date.now()}`
+              );
+              if (typeof mod.healBetterSqlite3Binding === "function") {
+                mod.healBetterSqlite3Binding(pluginRoot);
+              }
+            }
+          } catch { /* best effort — verifier below will fail loud */ }
+        }
+        if (!existsSync(bsqBindingPath)) {
+          // Mark the upgrade process for a non-zero exit at completion.
+          // Stays in scope only for the rest of upgrade(); the actual
+          // exit-code wiring sits below the top-level changes report.
+          process.exitCode = 1;
+          p.log.error(
+            color.red("better-sqlite3 native binding: MISSING") +
+              color.dim(`\n  Path: ${bsqBindingPath}`) +
+              color.dim("\n  Cause: npm silently skipped the package (Node engine mismatch, issue #514)") +
+              color.dim(`\n  Try (primary): cd "${pluginRoot}" && npm install better-sqlite3 --no-optional`) +
+              color.dim("\n  Try (fallback): /context-mode:ctx-doctor"),
+          );
+        }
       }
-      
+
       // Update global npm
       s.start("Updating npm global package");
       try {
