@@ -1957,12 +1957,16 @@ EXAMPLE: ctx_execute_file(path: "data.csv", language: "javascript", code: "const
         timeout,
       });
 
+      // Echo path + executed source code before stdout for audit/debug
+      // (Issues #717 + #736).
+      const echo = buildExecuteEcho(language, code, path);
+
       if (result.timedOut) {
         return trackResponse("ctx_execute_file", {
           content: [
             {
               type: "text" as const,
-              text: `Timed out processing ${path} after ${timeout}ms`,
+              text: `${echo}Timed out processing ${path} after ${timeout}ms`,
             },
           ],
           isError: true,
@@ -1977,7 +1981,7 @@ EXAMPLE: ctx_execute_file(path: "data.csv", language: "javascript", code: "const
           trackIndexed(Buffer.byteLength(output));
           return trackResponse("ctx_execute_file", {
             content: [
-              { type: "text" as const, text: intentSearch(output, intent, isError ? `file:${path}:error` : `file:${path}`) },
+              { type: "text" as const, text: `${echo}${intentSearch(output, intent, isError ? `file:${path}:error` : `file:${path}`)}` },
             ],
             isError,
           });
@@ -1987,14 +1991,14 @@ EXAMPLE: ctx_execute_file(path: "data.csv", language: "javascript", code: "const
           trackIndexed(Buffer.byteLength(output));
           return trackResponse("ctx_execute_file", {
             content: [
-              { type: "text" as const, text: intentSearch(output, "errors failures exceptions", isError ? `file:${path}:error` : `file:${path}`) },
+              { type: "text" as const, text: `${echo}${intentSearch(output, "errors failures exceptions", isError ? `file:${path}:error` : `file:${path}`)}` },
             ],
             isError,
           });
         }
         return trackResponse("ctx_execute_file", {
           content: [
-            { type: "text" as const, text: output },
+            { type: "text" as const, text: `${echo}${output}` },
           ],
           isError,
         });
@@ -2006,19 +2010,28 @@ EXAMPLE: ctx_execute_file(path: "data.csv", language: "javascript", code: "const
         trackIndexed(Buffer.byteLength(stdout));
         return trackResponse("ctx_execute_file", {
           content: [
-            { type: "text" as const, text: intentSearch(stdout, intent, `file:${path}`) },
+            { type: "text" as const, text: `${echo}${intentSearch(stdout, intent, `file:${path}`)}` },
           ],
         });
       }
 
       // Auto-index large stdout into FTS5 — return pointer, not raw content
       if (Buffer.byteLength(stdout) > LARGE_OUTPUT_THRESHOLD) {
-        return trackResponse("ctx_execute_file", indexStdout(stdout, `file:${path}`));
+        const indexed = indexStdout(stdout, `file:${path}`);
+        const echoed = {
+          ...indexed,
+          content: indexed.content.map((c, i) =>
+            i === 0 && c.type === "text"
+              ? { ...c, text: `${echo}${(c as { text: string }).text}` }
+              : c,
+          ),
+        };
+        return trackResponse("ctx_execute_file", echoed);
       }
 
       return trackResponse("ctx_execute_file", {
         content: [
-          { type: "text" as const, text: stdout },
+          { type: "text" as const, text: `${echo}${stdout}` },
         ],
       });
     } catch (err: unknown) {
