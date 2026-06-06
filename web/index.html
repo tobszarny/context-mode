@@ -310,28 +310,6 @@ pre code{overflow-wrap:normal;word-break:normal;white-space:pre}
 .adapter-event{font-family:var(--mono);font-size:10.5px;color:var(--text-2);background:var(--bg-code);padding:2px 7px;border-radius:3px;letter-spacing:.01em}
 .adapter-event.dim{color:var(--text-4);background:var(--bg-alt);font-style:italic}
 
-/* ── Waitlist form (shadcn-clean) ── */
-.waitlist-form{display:flex;flex-direction:column;gap:12px;margin-top:32px;max-width:560px}
-.waitlist-field{display:flex;flex-direction:column;gap:6px}
-.waitlist-label{font-family:var(--mono);font-size:11px;font-weight:600;color:var(--text-3);letter-spacing:.06em;text-transform:uppercase}
-.waitlist-input,.waitlist-textarea{width:100%;padding:11px 14px;border:1px solid var(--border);border-radius:6px;font-family:var(--sans);font-size:14.5px;color:var(--text);background:#fff;letter-spacing:-.005em;transition:border-color .15s,box-shadow .15s}
-.waitlist-input{height:44px}
-.waitlist-textarea{min-height:96px;resize:vertical;line-height:1.55}
-.waitlist-input:focus,.waitlist-textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(75,123,236,.12)}
-.waitlist-radio-group{display:flex;flex-wrap:wrap;gap:8px}
-.waitlist-radio-group label{position:relative;display:inline-flex;align-items:center;padding:9px 14px;border:1px solid var(--border);border-radius:6px;background:#fff;font-family:var(--sans);font-size:13.5px;color:var(--text-2);cursor:pointer;letter-spacing:-.005em;transition:border-color .15s,background .15s,color .15s}
-.waitlist-radio-group label:hover{border-color:var(--text-4);color:var(--text)}
-.waitlist-radio-group input[type=radio]{position:absolute;opacity:0;width:0;height:0;pointer-events:none}
-.waitlist-radio-group input[type=radio]:checked + span{color:var(--accent);font-weight:600}
-.waitlist-radio-group label:has(input[type=radio]:checked){border-color:var(--accent);background:rgba(75,123,236,.06);color:var(--accent)}
-.waitlist-radio-group input[type=radio]:focus-visible + span{outline:2px solid var(--accent);outline-offset:3px;border-radius:3px}
-.waitlist-form .cta{height:44px;align-self:flex-start;display:inline-flex;align-items:center;justify-content:center;white-space:nowrap;margin-top:4px}
-.waitlist-bullets{margin-top:28px;display:grid;grid-template-columns:repeat(3,1fr);gap:20px}
-@media(max-width:760px){.waitlist-bullets{grid-template-columns:1fr}}
-.waitlist-bullet{padding:18px 20px;border:1px solid var(--border);border-radius:8px;background:#fff}
-.waitlist-bullet strong{display:block;font-family:var(--sans);font-size:.95rem;font-weight:600;color:var(--text);margin-bottom:6px;letter-spacing:-.005em}
-.waitlist-bullet span{font-size:13px;color:var(--text-3);line-height:1.6}
-
 /* ── Local-only callout (shadcn info box) ── */
 .local-callout{margin-top:28px;padding:28px 32px;background:#fff;border:1px solid var(--border);border-radius:12px}
 @media(max-width:600px){.local-callout{padding:24px}}
@@ -439,7 +417,7 @@ footer{padding:64px 0 40px;text-align:center;background:var(--bg-alt);border-top
 
     <div class="hero-cta">
       <a href="https://platform.context-mode.com/signup" class="cta pri">Start for $20 / seat →</a>
-      <a href="#waitlist" class="cta sec">Or join the waitlist for hand-onboarding</a>
+      <a href="https://github.com/mksglu/context-mode" class="cta sec">Or run the OSS plugin locally</a>
     </div>
 
     <div class="hero-tags">
@@ -512,7 +490,7 @@ footer{padding:64px 0 40px;text-align:center;background:var(--bg-alt);border-top
     </div>
 
     <div class="gtm-strip rev">
-      <a href="#waitlist" class="cta pri">Join the waitlist →</a>
+      <a href="https://platform.context-mode.com/signup" class="cta pri">Start for $20 / seat →</a>
     </div>
   </div>
 </section>
@@ -704,7 +682,7 @@ commit_strong_cadence, commit_fix_heavy</span></pre>
     </div>
 
     <div class="gtm-strip rev">
-      <a href="#waitlist" class="cta pri">Join the waitlist</a>
+      <a href="https://platform.context-mode.com/signup" class="cta pri">Start for $20 / seat →</a>
     </div>
   </div>
 </section>
@@ -798,7 +776,7 @@ commit_strong_cadence, commit_fix_heavy</span></pre>
     </div>
 
     <div class="gtm-strip rev">
-      <a href="#waitlist" class="cta pri">Join the waitlist</a>
+      <a href="https://platform.context-mode.com/signup" class="cta pri">Start for $20 / seat →</a>
     </div>
   </div>
 </section>
@@ -896,7 +874,7 @@ commit_strong_cadence, commit_fix_heavy</span></pre>
     </div>
 
     <div class="gtm-strip rev">
-      <a href="#waitlist" class="cta pri">Join the waitlist</a>
+      <a href="https://platform.context-mode.com/signup" class="cta pri">Start for $20 / seat →</a>
     </div>
   </div>
 </section>
@@ -1039,7 +1017,7 @@ commit_strong_cadence, commit_fix_heavy</span></pre>
 
     <div class="gtm-strip rev">
       <a href="https://platform.context-mode.com/docs" class="cta pri">Browse all patterns</a>
-      <a href="#waitlist" class="cta sec">Join the waitlist</a>
+      <a href="https://platform.context-mode.com/signup" class="cta sec">Start for $20 / seat</a>
     </div>
   </div>
 </section>
@@ -1234,7 +1212,7 @@ commit_strong_cadence, commit_fix_heavy</span></pre>
 
     <div class="gtm-strip rev">
       <a href="mailto:beta@context-mode.com" class="cta pri">Request an integration</a>
-      <a href="#waitlist" class="cta sec">Join the waitlist</a>
+      <a href="https://platform.context-mode.com/signup" class="cta sec">Start for $20 / seat</a>
     </div>
   </div>
 </section>
@@ -1317,70 +1295,6 @@ commit_strong_cadence, commit_fix_heavy</span></pre>
   </div>
 </section>
 
-<!-- ═══════════════════════════════════════ WAITLIST ═══════════════════════════════════════ -->
-<section class="chapter" id="waitlist">
-  <div class="wrap">
-    <div class="rev" style="max-width:780px">
-      <p class="section-num">§ 12 · waitlist</p>
-      <h2 class="h2">Want a guided rollout? Tell us about your team.</h2>
-      <div class="rule"></div>
-      <p class="lead">Self-serve at <a href="https://platform.context-mode.com/signup">platform.context-mode.com</a> &mdash; $20/seat from day one, no trial. This form is for orgs that want a guided rollout instead of self-serve.</p>
-    </div>
-
-    <form action="https://api.web3forms.com/submit" method="POST" class="waitlist-form rev">
-      <input type="hidden" name="access_key" value="5b4dc744-b547-4432-881a-2f7ec83c3058">
-      <input type="hidden" name="subject" value="Insights waitlist signup">
-      <input type="hidden" name="from_name" value="context-mode Insights waitlist">
-      <div class="waitlist-field">
-        <label class="waitlist-label" for="wl-name">Name</label>
-        <input id="wl-name" type="text" name="name" required placeholder="Your name" class="waitlist-input">
-      </div>
-      <div class="waitlist-field">
-        <label class="waitlist-label" for="wl-email">Work email</label>
-        <input id="wl-email" type="email" name="email" required placeholder="you@company.com" class="waitlist-input">
-      </div>
-      <div class="waitlist-field">
-        <span class="waitlist-label">Team size</span>
-        <div class="waitlist-radio-group" role="radiogroup" aria-label="Team size">
-          <label><input type="radio" name="team_size" value="1-5" required><span>1–5</span></label>
-          <label><input type="radio" name="team_size" value="6-15"><span>6–15</span></label>
-          <label><input type="radio" name="team_size" value="16-50"><span>16–50</span></label>
-          <label><input type="radio" name="team_size" value="51-200"><span>51–200</span></label>
-          <label><input type="radio" name="team_size" value="200+"><span>200+</span></label>
-        </div>
-      </div>
-      <div class="waitlist-field">
-        <label class="waitlist-label" for="wl-seats">How many engineers will see the dashboard?</label>
-        <input id="wl-seats" type="number" name="seat_count" min="1" max="500" placeholder="e.g. 47" required class="waitlist-input">
-      </div>
-      <div class="waitlist-field">
-        <label class="waitlist-label" for="wl-message">Team context</label>
-        <textarea id="wl-message" name="message" required placeholder="A line or two about your team — which AI tools you ship today, what you would measure first." class="waitlist-textarea"></textarea>
-      </div>
-      <button type="submit" class="cta pri">Join the waitlist →</button>
-    </form>
-    <p class="muted rev" style="margin-top:14px;max-width:560px">We will reply within 24 hours with next steps and a 15-min walkthrough.</p>
-
-    <div class="waitlist-bullets rev">
-      <div class="waitlist-bullet">
-        <strong>Guided rollout</strong>
-        <span>We help you wire up Stripe, invite your members, configure org projects, and walk through the persona views together.</span>
-      </div>
-      <div class="waitlist-bullet">
-        <strong>Same Pro tier, same price</strong>
-        <span>$20 per seat per month from day one. The form is for hand-onboarding, not a separate plan. Cancel any time from the Stripe Customer Portal.</span>
-      </div>
-      <div class="waitlist-bullet">
-        <strong>Shape the patterns we ship</strong>
-        <span>Your session telemetry informs which patterns land in the v1 catalog. The blockers your team hits become the heuristics we encode.</span>
-      </div>
-    </div>
-
-  </div>
-</section>
-
-<hr class="sep">
-
 <!-- ═══════════════════════════════════════ FAQ ═══════════════════════════════════════ -->
 <section class="chapter">
   <div class="wrap-narrow">
@@ -1452,7 +1366,7 @@ commit_strong_cadence, commit_fix_heavy</span></pre>
       <p class="ld">If your team already runs the open-source plugin, we can have your first three findings live on the call. Bring an EM. We will run <code style="background:#1a2535;color:#a3bfff">find_blockers</code> against your real session telemetry.</p>
 
       <div class="final-cta">
-        <a href="#waitlist" class="pri">Join the waitlist →</a>
+        <a href="https://platform.context-mode.com/signup" class="pri">Start for $20 / seat →</a>
         <a href="mailto:beta@context-mode.com" class="sec">beta@context-mode.com</a>
       </div>
 
