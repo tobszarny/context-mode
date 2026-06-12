@@ -1,8 +1,10 @@
-// context-mode.com router — Master at /, OSS at /oss, Insight at /insight.
+// context-mode.com router — Master at /, Context Saving at /context-saving, Insight at /insight.
 //
-//   web/index.html    → served at /          (Context Mode master landing)
-//   web/oss.html      → served at /oss       (OSS plugin marketing)
-//   web/insight.html  → served at /insight   (Insight Solution marketing)
+//   web/index.html              → served at /                  (Context Mode master landing)
+//   web/context-saving.html     → served at /context-saving    (Context Saving plugin marketing)
+//   web/insight.html            → served at /insight           (Insight Solution marketing)
+//
+// /oss is preserved as a 301 redirect to /context-saving for backwards compatibility.
 //
 // platform.context-mode.com is the SPA app (separate deployment) — sign-in /
 // dashboard. This worker only handles marketing routing + asset fallthrough.
@@ -15,8 +17,11 @@ export default {
     if (path === "/") {
       return env.ASSETS.fetch(new Request(new URL("/index.html", url), req));
     }
+    if (path === "/context-saving") {
+      return env.ASSETS.fetch(new Request(new URL("/context-saving.html", url), req));
+    }
     if (path === "/oss") {
-      return env.ASSETS.fetch(new Request(new URL("/oss.html", url), req));
+      return Response.redirect(new URL("/context-saving" + url.search, url), 301);
     }
     if (path === "/insight") {
       return env.ASSETS.fetch(new Request(new URL("/insight.html", url), req));

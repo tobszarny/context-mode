@@ -3,34 +3,34 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>context-mode — Save 98% of your AI coding agent's context window</title>
-<meta name="description" content="An MCP plugin that keeps raw data out of the LLM context window. Sandbox tool output, index it into FTS5, search on demand. 287,000+ developers across 15 platforms. Open source.">
-<link rel="canonical" href="https://context-mode.com/oss">
-<link rel="icon" type="image/svg+xml" href="/favicon-oss.svg">
-<link rel="icon" type="image/png" sizes="32x32" href="/favicon-oss-32.png">
-<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon-oss.png">
+<title>Context Saving — context-mode plugin saves 98% of your AI agent's context window</title>
+<meta name="description" content="Context Saving is the open-source context-mode plugin that keeps raw data out of the LLM context window. Sandbox tool output, index it into FTS5, search on demand. 287,000+ developers across 15 platforms.">
+<link rel="canonical" href="https://context-mode.com/context-saving">
+<link rel="icon" type="image/svg+xml" href="/favicon-context-saving.svg">
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon-context-saving-32.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon-context-saving.png">
 
 <meta property="og:type" content="website">
-<meta property="og:title" content="context-mode — The other half of the context problem">
-<meta property="og:description" content="Your AI coding agent burns through context in 20 minutes. context-mode keeps 98% of tool output out of the conversation. 287,000+ developers across 15 platforms.">
-<meta property="og:url" content="https://context-mode.com/oss">
+<meta property="og:title" content="Context Saving — the other half of the context problem">
+<meta property="og:description" content="Your AI coding agent burns through context in 20 minutes. The context-mode plugin keeps 98% of tool output out of the conversation. 287,000+ developers across 15 platforms.">
+<meta property="og:url" content="https://context-mode.com/context-saving">
 <meta property="og:site_name" content="context-mode">
-<meta property="og:image" content="https://context-mode.com/og/oss.png">
+<meta property="og:image" content="https://context-mode.com/og/context-saving.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="627">
-<meta property="og:image:alt" content="context-mode — the other half of the context problem">
+<meta property="og:image:alt" content="Context Saving — the other half of the context problem">
 
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:site" content="@contextmode">
-<meta name="twitter:title" content="context-mode — Save 98% of your AI coding agent's context window">
-<meta name="twitter:image" content="https://context-mode.com/og/oss.png">
+<meta name="twitter:title" content="Context Saving — Save 98% of your AI coding agent's context window">
+<meta name="twitter:image" content="https://context-mode.com/og/context-saving.png">
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 
 <style>
-/* ── Tokens · OSS surface (dark terminal) per brand/STRATEGY.md ── */
+/* ── Tokens · Context Saving surface (dark terminal) per brand/STRATEGY.md ── */
 :root{
   --bg:#050807;--bg-2:#0d1b14;--bg-3:#0a0f0c;
   --fg:#fafafa;--text-2:#cbd5e1;--text-3:#94a3b8;--text-4:#6b7a8d;
@@ -60,7 +60,7 @@ code{font-family:var(--mono);font-size:.9em;background:var(--bg-3);color:var(--a
 
 /* ── Typography ── */
 .section-num{font-family:var(--mono);font-size:11px;font-weight:600;color:var(--text-4);letter-spacing:.12em;text-transform:uppercase}
-.h1{font-family:var(--mono);font-size:clamp(3rem,8vw,5.5rem);font-weight:600;color:var(--fg);line-height:1;letter-spacing:-.03em;display:inline-flex;align-items:baseline;gap:0}
+.h1{font-family:var(--mono);font-size:clamp(3rem,8vw,5.5rem);font-weight:600;color:var(--fg);line-height:1;letter-spacing:-.03em;display:flex;align-items:baseline;gap:0}
 .h1 .prompt{color:var(--text-4);font-weight:500;margin-right:.18em}
 .h1 .dash{color:var(--accent-2)}
 .h1 .cursor{display:inline-block;background:var(--accent);width:.30em;height:.92em;margin-left:.10em;box-shadow:0 0 24px rgba(16,185,129,.45);animation:blink 1.06s steps(2) infinite}
@@ -88,7 +88,7 @@ code{font-family:var(--mono);font-size:.9em;background:var(--bg-3);color:var(--a
 .hero::after{content:'';position:absolute;bottom:-30%;left:-15%;width:480px;height:480px;background:radial-gradient(circle,rgba(75,123,236,0.06) 0%,transparent 70%);pointer-events:none}
 .scan{position:absolute;inset:0;background:repeating-linear-gradient(0deg,transparent 0 3px,rgba(255,255,255,0.012) 4px,transparent 5px);pointer-events:none;-webkit-mask-image:radial-gradient(ellipse at center,#000 30%,transparent 80%);mask-image:radial-gradient(ellipse at center,#000 30%,transparent 80%)}
 .hero-inner{position:relative;z-index:1}
-.hero-tag{font-family:var(--mono);font-size:13px;color:var(--text-3);margin-bottom:24px;letter-spacing:.04em;display:inline-flex;align-items:center;gap:10px;padding:6px 14px;background:var(--bg-3);border:1px solid var(--border);border-radius:6px}
+.hero-tag{font-family:var(--mono);font-size:13px;color:var(--text-3);margin-top:24px;letter-spacing:.04em;display:inline-flex;align-items:center;gap:10px;padding:6px 14px;background:var(--bg-3);border:1px solid var(--border);border-radius:6px;align-self:flex-start}
 .hero-tag .dot{width:6px;height:6px;border-radius:50%;background:var(--accent);box-shadow:0 0 10px rgba(16,185,129,.7)}
 .hero-tag a{color:var(--text-3)}
 .hero-sub{font-size:clamp(1.1rem,2.5vw,1.4rem);color:var(--text-2);font-weight:300;margin-top:22px;max-width:880px;line-height:1.55}
@@ -251,7 +251,7 @@ footer{padding:64px 0 40px;text-align:center;background:var(--bg-2);border-top:1
   <div class="wrap topnav-inner">
     <a href="/" class="topnav-brand"><span class="prompt">$</span>context<span class="dash">-</span>mode<span class="cursor"></span></a>
     <div class="topnav-menu">
-      <a href="/oss" class="topnav-item active">OSS Plugin</a>
+      <a href="/context-saving" class="topnav-item active">Context Saving</a>
       <div class="dropdown">
         <button class="topnav-item" aria-haspopup="true">Solutions <span class="caret">▾</span></button>
         <div class="dropdown-menu">
@@ -288,8 +288,8 @@ footer{padding:64px 0 40px;text-align:center;background:var(--bg-2);border-top:1
 <section class="hero">
   <div class="scan"></div>
   <div class="hero-inner wrap rev">
-    <p class="hero-tag"><span class="dot"></span>open-source plugin · ELv2 · part of <a href="/">Context Mode</a></p>
     <h1 class="h1"><span class="prompt">$</span>context<span class="dash">-</span>mode<span class="cursor"></span></h1>
+    <p class="hero-tag"><span class="dot"></span>open-source plugin · ELv2 · part of <a href="/">Context Mode</a></p>
     <p class="hero-sub">
       <strong>The other half of the context problem.</strong> An MCP plugin that sandboxes tool output and indexes it into a local FTS5 store. Your AI coding agent searches that store instead of re-sending raw bytes every turn. <em>15 platforms. <span class="js-user-count">287,000+</span> developers. Runs entirely on your machine.</em>
     </p>

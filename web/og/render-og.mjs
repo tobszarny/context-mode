@@ -11,7 +11,7 @@ const __dir = dirname(fileURLToPath(import.meta.url));
 const ASSETS = [
   { src: 'master-og.html',  out: 'master.png'  },
   { src: 'insight-og.html', out: 'insight.png' },
-  { src: 'oss-og.html',     out: 'oss.png'     },
+  { src: 'context-saving-og.html', out: 'context-saving.png' },
 ];
 
 const W = 1200, H = 630;
