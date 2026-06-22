@@ -120,29 +120,48 @@ describe("ctx_execute_file: project-boundary guard wiring (#852)", () => {
   const __dirname = dirname(fileURLToPath(import.meta.url));
   const serverSrc = readFileSync(resolve(__dirname, "../../src/server.ts"), "utf-8");
 
+  // Algorithmic source-introspection helpers (no regex — project no-regex rule).
+  // extractBlock: slice from a marker to the first top-level closing brace ("\n}").
+  function extractBlock(src: string, marker: string): string | null {
+    const start = src.indexOf(marker);
+    if (start === -1) return null;
+    const end = src.indexOf("\n}", start);
+    return end === -1 ? src.slice(start) : src.slice(start, end + 2);
+  }
+
+  // titleAfter: the first double-quoted string following a `title:` key that
+  // appears after `marker` — equivalent to capturing group 1 of the old regex.
+  function titleAfter(src: string, marker: string): string | null {
+    const i = src.indexOf(marker);
+    if (i === -1) return null;
+    const t = src.indexOf("title:", i);
+    if (t === -1) return null;
+    const q1 = src.indexOf('"', t);
+    const q2 = src.indexOf('"', q1 + 1);
+    return q1 === -1 || q2 === -1 ? null : src.slice(q1 + 1, q2);
+  }
+
   test("checkProjectBoundary helper exists", () => {
     expect(serverSrc).toContain("function checkProjectBoundary");
   });
 
   test("guard resolves via canonical getProjectDir() and evaluateProjectContainment", () => {
-    const m = serverSrc.match(/function checkProjectBoundary[\s\S]*?^}/m);
-    expect(m).not.toBeNull();
-    const body = m![0];
-    expect(body).toMatch(/getProjectDir\(\)/);
-    expect(body).toMatch(/evaluateProjectContainment/);
+    const body = extractBlock(serverSrc, "function checkProjectBoundary");
+    expect(body).not.toBeNull();
+    expect(body!).toContain("getProjectDir()");
+    expect(body!).toContain("evaluateProjectContainment");
   });
 
   test("ctx_execute_file handler calls the boundary guard", () => {
     // The guard must run inside the ctx_execute_file handler.
-    expect(serverSrc).toMatch(/checkProjectBoundary\(\s*path\s*,\s*"ctx_execute_file"\s*\)/);
+    expect(serverSrc).toContain('checkProjectBoundary(path, "ctx_execute_file")');
   });
 
   test("escape hatch reuses host permissions.allow Read rules — NO bespoke opt-out env", () => {
     // Principled escape hatch: read the host's existing allow rules, not a
     // context-mode-specific env that would become dead code.
-    const m = serverSrc.match(/function checkProjectBoundary[\s\S]*?^}/m);
-    const body = m![0];
-    expect(body).toMatch(/readToolPermissionPatterns\(\s*"Read"\s*,\s*"allow"/);
+    const body = extractBlock(serverSrc, "function checkProjectBoundary")!;
+    expect(body).toContain('readToolPermissionPatterns("Read", "allow"');
     // The dead-code env flag must NOT exist anywhere in server.ts.
     expect(serverSrc).not.toContain("CONTEXT_MODE_ALLOW_OUTSIDE_PROJECT");
     expect(serverSrc).not.toContain("allowOutsideProject");
@@ -151,9 +170,10 @@ describe("ctx_execute_file: project-boundary guard wiring (#852)", () => {
   test("execution tools announce code execution in their MCP-prompt title (#852)", () => {
     // refs(claude-code): the approval prompt renders `serverName - <title> (MCP)`;
     // the title is the one server-controlled field, so it must read as code-exec.
-    const execTitle = serverSrc.match(/"ctx_execute",[\s\S]*?title:\s*"([^"]+)"/);
-    const fileTitle = serverSrc.match(/"ctx_execute_file",[\s\S]*?title:\s*"([^"]+)"/);
-    expect(execTitle?.[1]?.toLowerCase()).toContain("code");
-    expect(fileTitle?.[1]?.toLowerCase()).toMatch(/code|execute/);
+    const execTitle = titleAfter(serverSrc, '"ctx_execute",');
+    const fileTitle = titleAfter(serverSrc, '"ctx_execute_file",');
+    expect(execTitle?.toLowerCase()).toContain("code");
+    const fileLower = fileTitle?.toLowerCase() ?? "";
+    expect(fileLower.includes("code") || fileLower.includes("execute")).toBe(true);
   });
 });
