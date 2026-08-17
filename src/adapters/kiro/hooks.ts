@@ -1,4 +1,4 @@
-import { buildNodeCommand } from "../types.js";
+import { buildHookRuntimeCommand } from "../types.js";
 
 /**
  * adapters/kiro/hooks — Kiro CLI hook definitions and matchers.
@@ -30,6 +30,26 @@ export const HOOK_SCRIPTS: Record<string, string> = {
 };
 
 // ─────────────────────────────────────────────────────────
+// External MCP routing matcher (#529)
+// ─────────────────────────────────────────────────────────
+
+/**
+ * Negative-lookahead matcher for external MCP tool namespaces on Kiro (#529).
+ *
+ * Kiro MCP wire shape: `@<server>/<tool>` (verified in
+ * hooks/core/tool-naming.mjs — context-mode's own tools surface as
+ * `@context-mode/<tool>`). This pattern fires PreToolUse for any external
+ * `@<server>/<tool>` whose server segment is NOT `context-mode`. Without it,
+ * large payloads from slack / telegram / gdrive / notion-style MCPs bypass
+ * the routing nudge and flood the model's context window — PostToolUse runs
+ * too late to keep the raw data out.
+ *
+ * Routing.mjs `isExternalMcpTool` is extended to recognise the `@<server>/`
+ * prefix shape so the routing branch returns external-MCP guidance.
+ */
+export const EXTERNAL_MCP_MATCHER_PATTERN = "@(?!context-mode/)";
+
+// ─────────────────────────────────────────────────────────
 // PreToolUse matchers
 // ─────────────────────────────────────────────────────────
 
@@ -47,6 +67,7 @@ export const PRE_TOOL_USE_MATCHERS = [
   "@context-mode/ctx_execute",
   "@context-mode/ctx_execute_file",
   "@context-mode/ctx_batch_execute",
+  EXTERNAL_MCP_MATCHER_PATTERN,
 ] as const;
 
 /**
@@ -83,7 +104,7 @@ export function isContextModeHook(
 export function buildHookCommand(hookType: string, pluginRoot?: string): string {
   const scriptName = HOOK_SCRIPTS[hookType];
   if (pluginRoot && scriptName) {
-    return buildNodeCommand(`${pluginRoot}/hooks/kiro/${scriptName}`);
+    return buildHookRuntimeCommand(`${pluginRoot}/hooks/kiro/${scriptName}`);
   }
   return `context-mode hook kiro ${hookType.toLowerCase()}`;
 }

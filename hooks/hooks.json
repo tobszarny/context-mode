@@ -1,5 +1,5 @@
 {
-  "description": "Context-mode hooks — PreToolUse routing, PostToolUse session capture, PreCompact snapshot, SessionStart context injection",
+  "description": "Context-mode hooks — PreToolUse routing, PostToolUse session capture, UserPromptSubmit decisions, PreCompact snapshot, SessionStart context injection, Stop turn-end capture",
   "hooks": {
     "PostToolUse": [
       {
@@ -95,6 +95,15 @@
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/pretooluse.mjs\""
           }
         ]
+      },
+      {
+        "matcher": "mcp__",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/pretooluse.mjs\""
+          }
+        ]
       }
     ],
     "UserPromptSubmit": [
@@ -115,6 +124,17 @@
           {
             "type": "command",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/sessionstart.mjs\""
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/stop.mjs\""
           }
         ]
       }

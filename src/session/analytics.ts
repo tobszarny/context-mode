@@ -14,6 +14,7 @@ import { existsSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, sep } from "node:path";
 import { loadDatabase as loadDatabaseImpl } from "../db-base.js";
+import { ensureSessionEventsSchema } from "./db.js";
 import { resolveClaudeConfigDir } from "../util/claude-config.js";
 
 function semverNewer(a: string, b: string): boolean {
@@ -135,7 +136,19 @@ export interface RuntimeStats {
   calls: Record<string, number>;
   sessionStart: number;
   cacheHits: number;
+  cacheMisses?: number;
   cacheBytesSaved: number;
+}
+
+/**
+ * Index observability snapshot — point-in-time view of the persistent
+ * content store. Optional input to `formatReport` so callers that don't
+ * have store access (or don't want the extra DB hit) can omit it.
+ */
+export interface IndexState {
+  totalChunks: number;
+  totalSources: number;
+  lastIndexedAt?: string; // ISO-8601 when available
 }
 
 // ─────────────────────────────────────────────────────────
@@ -159,6 +172,8 @@ export interface FullReport {
   };
   cache?: {
     hits: number;
+    misses: number;
+    hit_rate: number; // hits / (hits + misses); 0 when both are zero
     bytes_saved: number;
     ttl_hours_left: number;
     total_with_cache: number;
@@ -210,7 +225,8 @@ export const categoryLabels: Record<string, string> = {
   // Configuration & intent
   rule: "Project rules (CLAUDE.md)",
   prompt: "Your requests saved",
-  intent: "Session goal",
+  intent: "Session intent",
+  goal: "Session goal",
   role: "Behavior rules",
   constraint: "Constraints you set",
   // Tools & delegation
@@ -380,7 +396,8 @@ export class AnalyticsEngine {
       let median: number | null = null;
       let max: number | null = null;
       if (b.concurrencies.length > 0) {
-        const sorted = [...b.concurrencies].sort((a, c) => a - c);
+        b.concurrencies.sort((a, c) => a - c);
+        const sorted = b.concurrencies;
         const mid = Math.floor(sorted.length / 2);
         median = sorted.length % 2 === 0
           ? (sorted[mid - 1] + sorted[mid]) / 2
@@ -447,12 +464,21 @@ export class AnalyticsEngine {
 
     // ── Cache ──
     let cache: FullReport["cache"];
-    if (runtimeStats.cacheHits > 0 || runtimeStats.cacheBytesSaved > 0) {
+    const cacheMisses = runtimeStats.cacheMisses ?? 0;
+    if (runtimeStats.cacheHits > 0 || runtimeStats.cacheBytesSaved > 0 || cacheMisses > 0) {
       const totalWithCache = totalProcessed + runtimeStats.cacheBytesSaved;
       const totalSavingsRatio = totalWithCache / Math.max(totalBytesReturned, 1);
       const ttlHoursLeft = Math.max(0, 24 - Math.floor((Date.now() - runtimeStats.sessionStart) / (60 * 60 * 1000)));
+      // hit_rate is the nominal cache effectiveness — the metric ctx_stats
+      // historically inferred-only by diffing tokens_saved snapshots. When
+      // there is no activity we report 0 instead of NaN/undefined so the
+      // renderer stays JSON-safe.
+      const totalLookups = runtimeStats.cacheHits + cacheMisses;
+      const hitRate = totalLookups > 0 ? runtimeStats.cacheHits / totalLookups : 0;
       cache = {
         hits: runtimeStats.cacheHits,
+        misses: cacheMisses,
+        hit_rate: hitRate,
         bytes_saved: runtimeStats.cacheBytesSaved,
         ttl_hours_left: ttlHoursLeft,
         total_with_cache: totalWithCache,
@@ -592,7 +618,7 @@ export interface AdapterDirEntry {
  * so a single call surfaces "your work everywhere on this machine across
  * all AI tools" (the marketing line).
  *
- * Returns ALL 15 adapters even when the dir doesn't exist on disk — the
+ * Returns ALL 17 adapters even when the dir doesn't exist on disk — the
  * scanner functions filter to existing dirs. That keeps the enumeration
  * pure / testable without filesystem dependencies.
  */
@@ -603,10 +629,12 @@ export function enumerateAdapterDirs(opts?: { home?: string }): AdapterDirEntry[
     ["claude-code",      [".claude"]],
     ["gemini-cli",       [".gemini"]],
     ["antigravity",      [".gemini"]],
+    ["antigravity-cli",  [".gemini"]],
     ["openclaw",         [".openclaw"]],
     ["codex",            [".codex"]],
     ["cursor",           [".cursor"]],
     ["vscode-copilot",   [".vscode"]],
+    ["copilot-cli",      [".copilot"]],
     ["kiro",             [".kiro"]],
     ["pi",               [".pi"]],
     ["omp",              [".omp"]],
@@ -1014,7 +1042,113 @@ export interface RealBytesStats {
   bytesAvoided: number;
   bytesReturned: number;
   snapshotBytes: number;
+  /**
+   * v1.0.133 Slice 3: bytes attributed to this session in the FTS5 content
+   * DB — `SUM(LENGTH(title) + LENGTH(content)) FROM chunks WHERE session_id = ?`.
+   *
+   * Read-only, render-time computation. Populated only when
+   * `getRealBytesStats` is called with both `sessionId` AND `contentDbPath`
+   * (i.e. the conversation tier from ctx_stats). Lifetime / project tiers
+   * leave this at 0 — aggregating across every adapter's content DB is a
+   * separate concern.
+   *
+   * Legacy chunks with empty `session_id` (pre-Slice-1) are NOT backfilled:
+   * the architect rejected the time-window join as unsafe. Old conversations
+   * stay low; new conversations populate honestly.
+   */
+  contentBytes: number;
   totalSavedTokens: number;
+}
+
+/**
+ * v1.0.133 Slice 3: Sum the bytes attributed to one session in the FTS5
+ * content DB.
+ *
+ * Returns `LENGTH(title) + LENGTH(content)` summed across every chunk
+ * whose `session_id` column matches `sessionId`. Best-effort — returns 0
+ * when the DB file is missing, the schema lacks the `session_id` column
+ * (pre-Slice-1 content DBs), or the query fails. Never throws.
+ *
+ * Render-time only. Does NOT mutate the content DB. Architect-approved
+ * because the read-only join carries no risk of cross-session attribution
+ * (the FK was set at chunk insert time by Slice 1).
+ */
+export function getContentBytesForSession(
+  sessionId: string,
+  contentDbPath: string,
+  opts?: { loadDatabase?: () => unknown },
+): number {
+  if (!sessionId || !contentDbPath) return 0;
+  if (!existsSync(contentDbPath)) return 0;
+
+  let DatabaseCtor: ReturnType<typeof loadDatabaseImpl> | null = null;
+  try {
+    DatabaseCtor = opts?.loadDatabase
+      ? (opts.loadDatabase() as ReturnType<typeof loadDatabaseImpl>)
+      : loadDatabaseImpl();
+  } catch { return 0; }
+  if (!DatabaseCtor) return 0;
+
+  try {
+    const db = new DatabaseCtor(contentDbPath, { readonly: true });
+    try {
+      const row = db.prepare(
+        `SELECT COALESCE(SUM(LENGTH(content) + LENGTH(title)), 0) AS bytes
+         FROM chunks WHERE session_id = ?`,
+      ).get(sessionId) as { bytes: number } | undefined;
+      return Number(row?.bytes ?? 0);
+    } finally {
+      db.close();
+    }
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * v1.0.134 SLICE C — lifetime tier all-chunks aggregate.
+ *
+ * Sibling of {@link getContentBytesForSession} that omits the session_id
+ * filter so the lifetime tier sees every chunk in the content store —
+ * including legacy unattributed rows (sessionId === '') and chunks
+ * attributed to other adapters' sessions. Without this, the lifetime
+ * "kept out" headline only counts session_events.bytes_avoided and
+ * misses the bulk of indexed payload.
+ *
+ * Best-effort: returns 0 when the DB file is missing, the schema lacks
+ * the `chunks` table, or the query fails. Never throws — same contract
+ * as the rest of the analytics module so a corrupt content DB cannot
+ * crash ctx_stats.
+ */
+export function getContentBytesAllSessions(
+  contentDbPath: string,
+  opts?: { loadDatabase?: () => unknown },
+): number {
+  if (!contentDbPath) return 0;
+  if (!existsSync(contentDbPath)) return 0;
+
+  let DatabaseCtor: ReturnType<typeof loadDatabaseImpl> | null = null;
+  try {
+    DatabaseCtor = opts?.loadDatabase
+      ? (opts.loadDatabase() as ReturnType<typeof loadDatabaseImpl>)
+      : loadDatabaseImpl();
+  } catch { return 0; }
+  if (!DatabaseCtor) return 0;
+
+  try {
+    const db = new DatabaseCtor(contentDbPath, { readonly: true });
+    try {
+      const row = db.prepare(
+        `SELECT COALESCE(SUM(LENGTH(content) + LENGTH(title)), 0) AS bytes
+         FROM chunks`,
+      ).get() as { bytes: number } | undefined;
+      return Number(row?.bytes ?? 0);
+    } finally {
+      db.close();
+    }
+  } catch {
+    return 0;
+  }
 }
 
 /**
@@ -1035,6 +1169,32 @@ export function getRealBytesStats(opts: {
   sessionId?: string;
   sessionsDir?: string;
   worktreeHash?: string;
+  /**
+   * v1.0.148 follow-up (Bug E+F): when set, the function aggregates across
+   * EVERY session whose `session_meta.project_dir` matches this value, not
+   * just one session_id. Resolves the per-conversation under-attribution:
+   * one Claude Code conversation typically spans many session_ids (resume
+   * cycles, /compact rebirths, PID sub-process sessions spawned by
+   * ctx_execute), so a single-session_id filter loses the sandbox-burst
+   * bytes_avoided that all live under the conversation's cwd.
+   *
+   * Uses a META subquery (`session_id IN (SELECT session_id FROM
+   * session_meta WHERE project_dir = ?)`), then sums ALL events for
+   * matching sessions regardless of their event-level project_dir
+   * (sandbox-burst events write `project_dir = ''` even when the
+   * META row carries the parent cwd — see Bug F).
+   *
+   * Mutually exclusive with `sessionId`. When both are set, `sessionId`
+   * wins for back-compat.
+   */
+  projectDir?: string;
+  /**
+   * v1.0.133 Slice 3: when set alongside `sessionId`, the function joins
+   * the FTS5 content DB at this path and folds chunk bytes into
+   * `bytesAvoided` + `totalSavedTokens` + `contentBytes`. Render-time
+   * only — no DB writes.
+   */
+  contentDbPath?: string;
   loadDatabase?: () => unknown;
 }): RealBytesStats {
   const empty: RealBytesStats = {
@@ -1042,6 +1202,7 @@ export function getRealBytesStats(opts: {
     bytesAvoided: 0,
     bytesReturned: 0,
     snapshotBytes: 0,
+    contentBytes: 0,
     totalSavedTokens: 0,
   };
 
@@ -1076,6 +1237,19 @@ export function getRealBytesStats(opts: {
   // don't need to type-narrow per row.
   for (const file of dbFiles) {
     const dbPath = join(sessionsDir, file);
+    // v1.0.148 hotfix: historical DBs were created with pre-v1.0.130
+    // schema (no bytes_avoided / bytes_returned / project_dir columns).
+    // The SELECT below references those columns, so without an in-place
+    // migration the prepare() throws and the surrounding catch silently
+    // skips the WHOLE DB — losing even the LENGTH(data) signal. Run the
+    // shared migration helper before opening readonly. Idempotent: a
+    // PRAGMA check inside the helper short-circuits when the DB is
+    // already current, so post-first-read calls are cheap.
+    ensureSessionEventsSchema(dbPath, DatabaseCtor as unknown as new (path: string, opts?: { readonly?: boolean }) => {
+      pragma: (q: string) => Array<{ name: string }>;
+      exec: (sql: string) => void;
+      close: () => void;
+    });
     try {
       const sdb = new DatabaseCtor(dbPath, { readonly: true });
       try {
@@ -1100,6 +1274,62 @@ export function getRealBytesStats(opts: {
             ).get(opts.sessionId) as { bytes: number } | undefined;
             if (snap?.bytes) snapshotBytes += Number(snap.bytes);
           } catch { /* old schema */ }
+          try {
+            // "With context-mode" = the bytes the model paid to ACCESS the
+            // kept-out content: ctx_search (query the index) + ctx_fetch_and_index
+            // (fetch + index a URL). Sandbox compute (ctx_execute/batch/file) is
+            // work-output the model would see regardless — NOT redirect savings —
+            // so it is excluded; folding it crushed the bar to a false ~43%.
+            const tc = sdb.prepare(
+              `SELECT COALESCE(SUM(bytes_returned), 0) AS bytes FROM tool_calls
+               WHERE session_id = ? AND tool IN ('ctx_search', 'ctx_fetch_and_index')`,
+            ).get(opts.sessionId) as { bytes: number } | undefined;
+            if (tc?.bytes) bytesReturned += Number(tc.bytes);
+          } catch { /* old schema: no tool_calls table */ }
+        } else if (opts.projectDir) {
+          // Bug E+F: META-scoped aggregation. Take every session_id whose
+          // session_meta.project_dir matches, then sum ALL of those
+          // sessions' events regardless of the events' own project_dir
+          // (sandbox-burst PID sessions write empty event-level project_dir
+          // even when their META carries the parent cwd).
+          const row = sdb.prepare(
+            `SELECT
+               COALESCE(SUM(LENGTH(data)), 0)   AS data_bytes,
+               COALESCE(SUM(bytes_avoided), 0)  AS bytes_avoided,
+               COALESCE(SUM(bytes_returned), 0) AS bytes_returned
+             FROM session_events
+             WHERE session_id IN (
+               SELECT session_id FROM session_meta WHERE project_dir = ?
+             )`,
+          ).get(opts.projectDir) as
+            | { data_bytes: number; bytes_avoided: number; bytes_returned: number }
+            | undefined;
+          if (row) {
+            eventDataBytes += Number(row.data_bytes ?? 0);
+            bytesAvoided   += Number(row.bytes_avoided ?? 0);
+            bytesReturned  += Number(row.bytes_returned ?? 0);
+          }
+          try {
+            const snap = sdb.prepare(
+              `SELECT COALESCE(SUM(LENGTH(snapshot)), 0) AS bytes
+               FROM session_resume
+               WHERE session_id IN (
+                 SELECT session_id FROM session_meta WHERE project_dir = ?
+               )`,
+            ).get(opts.projectDir) as { bytes: number } | undefined;
+            if (snap?.bytes) snapshotBytes += Number(snap.bytes);
+          } catch { /* old schema */ }
+          try {
+            const tc = sdb.prepare(
+              `SELECT COALESCE(SUM(bytes_returned), 0) AS bytes
+               FROM tool_calls
+               WHERE session_id IN (
+                 SELECT session_id FROM session_meta WHERE project_dir = ?
+               )
+               AND tool IN ('ctx_search', 'ctx_fetch_and_index')`,
+            ).get(opts.projectDir) as { bytes: number } | undefined;
+            if (tc?.bytes) bytesReturned += Number(tc.bytes);
+          } catch { /* old schema: no tool_calls table */ }
         } else {
           const row = sdb.prepare(
             `SELECT
@@ -1121,6 +1351,13 @@ export function getRealBytesStats(opts: {
             ).get() as { bytes: number } | undefined;
             if (snap?.bytes) snapshotBytes += Number(snap.bytes);
           } catch { /* old schema */ }
+          try {
+            const tc = sdb.prepare(
+              `SELECT COALESCE(SUM(bytes_returned), 0) AS bytes FROM tool_calls
+               WHERE tool IN ('ctx_search', 'ctx_fetch_and_index')`,
+            ).get() as { bytes: number } | undefined;
+            if (tc?.bytes) bytesReturned += Number(tc.bytes);
+          } catch { /* old schema: no tool_calls table */ }
         }
       } finally {
         sdb.close();
@@ -1128,11 +1365,88 @@ export function getRealBytesStats(opts: {
     } catch { /* missing tables / corrupt — skip */ }
   }
 
+  // v1.0.133 Slice 3: fold content DB chunk bytes for this session into
+  // bytesAvoided. Skipped silently when caller didn't pass contentDbPath
+  // (lifetime / project tiers, or pre-Slice-3 callers). Treated as
+  // "avoided" because indexed chunks are bytes that would have been
+  // re-inflated into context on every search if the model had to
+  // re-read raw files.
+  let contentBytes = 0;
+  if (opts.sessionId && opts.contentDbPath) {
+    contentBytes = getContentBytesForSession(
+      opts.sessionId,
+      opts.contentDbPath,
+      { loadDatabase: opts.loadDatabase },
+    );
+    bytesAvoided += contentBytes;
+  }
+
   const totalSavedTokens = Math.floor(
     (eventDataBytes + bytesAvoided + snapshotBytes) / 4,
   );
 
-  return { eventDataBytes, bytesAvoided, bytesReturned, snapshotBytes, totalSavedTokens };
+  return { eventDataBytes, bytesAvoided, bytesReturned, snapshotBytes, contentBytes, totalSavedTokens };
+}
+
+/**
+ * v1.0.169 — Section 1 "Where you are now" = the LIVE conversation window.
+ *
+ * A single live conversation fans out into sub-agents and ctx_execute
+ * sub-process sessions. Each runs in its OWN, disposable context window (its
+ * own session_id) — but all under the SAME worktree DB, because the worktree
+ * hash is sha256(cwd) and they share the cwd. Their retrieval (ctx_search /
+ * ctx_fetch_and_index returns) entered THOSE windows and was thrown away when
+ * each returned its short summary; it never touched the window the user is
+ * reading now. So the live-window savings bar must split the worktree by
+ * which retrieval actually landed in the user's window:
+ *
+ *   bytesReturned ("With context-mode")  = THIS session's retrieval only —
+ *       what genuinely entered the live window.
+ *   bytesAvoided  ("kept out")           = everything the whole worktree moved
+ *       (avoided + every session's retrieval) MINUS what landed in your window.
+ *
+ * Scoping by `worktreeHash` (not project-root + time) means the user's OTHER
+ * parallel worktrees never bleed in — a different worktree is a different
+ * cwd-hash, hence a different DB file the prefix filter excludes — while the
+ * sub-agent fan-out this conversation actually spawned is fully credited.
+ */
+export function getConversationWindowStats(opts: {
+  sessionId: string;
+  worktreeHash: string;
+  sessionsDir?: string;
+  contentDbPath?: string;
+}): RealBytesStats {
+  // Whole current worktree: every session that shares this cwd-hash DB.
+  const pool = getRealBytesStats({
+    worktreeHash: opts.worktreeHash,
+    sessionsDir: opts.sessionsDir,
+  });
+  // Just the live window: this session_id (folds its own ctx_search/ctx_fetch
+  // retrieval + content chunks).
+  const mine = getRealBytesStats({
+    sessionId: opts.sessionId,
+    worktreeHash: opts.worktreeHash,
+    sessionsDir: opts.sessionsDir,
+    contentDbPath: opts.contentDbPath,
+  });
+
+  const windowReturned = mine.bytesReturned;
+  const movedTotal = pool.bytesAvoided + pool.bytesReturned;
+  // What context-mode kept OUT of the live window = everything moved across the
+  // worktree minus the slice that actually entered this window. Clamp at 0 so a
+  // stale/edge DB can never produce a negative bar.
+  const keptOut = Math.max(0, movedTotal - windowReturned);
+
+  return {
+    eventDataBytes: pool.eventDataBytes,
+    bytesAvoided: keptOut,
+    bytesReturned: windowReturned,
+    snapshotBytes: pool.snapshotBytes,
+    contentBytes: mine.contentBytes,
+    totalSavedTokens: Math.floor(
+      (pool.eventDataBytes + keptOut + pool.snapshotBytes) / 4,
+    ),
+  };
 }
 
 // ─────────────────────────────────────────────────────────
@@ -1381,6 +1695,7 @@ export function getMultiAdapterRealBytesStats(opts?: {
     bytesAvoided: 0,
     bytesReturned: 0,
     snapshotBytes: 0,
+    contentBytes: 0,
     totalSavedTokens: 0,
   };
   const perAdapter: MultiAdapterRealBytesStats["perAdapter"] = [];
@@ -1393,6 +1708,21 @@ export function getMultiAdapterRealBytesStats(opts?: {
       worktreeHash: opts?.worktreeHash,
       loadDatabase: opts?.loadDatabase,
     });
+    // ARCH-REVIEW-V134-ABC SLICE C: aggregate this adapter's content DB
+    // bytes into the lifetime sum. `getRealBytesStats` operates on
+    // session events only and never touches the sibling content/ tree —
+    // without this step the lifetime tier in ctx_stats reports 0 for
+    // every adapter except whichever one happens to share the
+    // sessionsDir of the caller. Lifetime tier ignores sessionId so
+    // the all-sessions aggregator is the right helper here.
+    if (!opts?.sessionId) {
+      const contentDbPath = join(entry.contentDir, "content.db");
+      const adapterContentBytes = getContentBytesAllSessions(contentDbPath, {
+        loadDatabase: opts?.loadDatabase as (() => unknown) | undefined,
+      });
+      one.contentBytes += adapterContentBytes;
+      sum.contentBytes += adapterContentBytes;
+    }
     perAdapter.push({ name: entry.name, ...one });
     sum.eventDataBytes += one.eventDataBytes;
     sum.bytesAvoided   += one.bytesAvoided;
@@ -1430,10 +1760,12 @@ export const adapterLabels: Record<string, string> = {
   "claude-code":       "Claude Code",
   "gemini-cli":        "Gemini CLI",
   "antigravity":       "Antigravity",
+  "antigravity-cli":   "Antigravity CLI",
   "openclaw":          "Openclaw",
   "codex":             "Codex CLI",
   "cursor":            "Cursor",
   "vscode-copilot":    "VS Code Copilot",
+  "copilot-cli":       "GitHub Copilot CLI",
   "kiro":              "Kiro",
   "pi":                "Pi",
   "omp":               "OMP",
@@ -1514,9 +1846,42 @@ function formatDuration(uptimeMin: string): string {
  * Timezone always uses `Intl.DateTimeFormat().resolvedOptions().timeZone`
  * — that one's always available and correct regardless of platform.
  */
+/**
+ * Validate that a locale string is a usable BCP 47 tag.
+ *
+ * Ubuntu GHA runners default to `LANG=C.UTF-8`. The extractor below strips
+ * that to `"C"` — a valid POSIX locale identifier but NOT a BCP 47 tag.
+ * On macOS / Node 20, `new Intl.DateTimeFormat("C", …)` throws RangeError
+ * outright. CI run 25887250971 caught this via the v1.0.134 SLICE B test.
+ *
+ * Earlier fix attempt used a permissive `supportedLocalesOf || construction`
+ * OR check — that was wrong: on Linux + Node 22.5, `new Intl.DateTimeFormat
+ * ("POSIX")` does NOT throw, it silently falls back to the root locale and
+ * still emits garbage at format time. CI run 25904838577 surfaced that —
+ * "POSIX" round-tripped through the validator unchanged.
+ *
+ * Strict gate: `Intl.DateTimeFormat.supportedLocalesOf(tag)` returns `[]` for
+ * any tag that doesn't map to a real language (regardless of whether
+ * construction with that tag throws). That's the contract we want — "is this
+ * a BCP 47 tag the host actually has data for". Construction is an explicit
+ * sanity check; both must pass.
+ */
+function isUsableBcp47Locale(raw: string): boolean {
+  if (!raw) return false;
+  try {
+    if (Intl.DateTimeFormat.supportedLocalesOf(raw).length === 0) return false;
+    // Belt: confirm construction doesn't throw on this host either.
+    new Intl.DateTimeFormat(raw);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function detectLocaleAndTz(): { locale: string; tz: string } {
   const env = (process.env ?? {}) as Record<string, string | undefined>;
   let locale = env.CONTEXT_MODE_LOCALE ?? "";
+  if (locale && !isUsableBcp47Locale(locale)) locale = "";
   if (!locale) {
     if (process.platform === "darwin") {
       try {
@@ -1529,10 +1894,15 @@ export function detectLocaleAndTz(): { locale: string; tz: string } {
         }).trim();
         if (out) locale = out.replace(/_/g, "-");
       } catch { /* defaults missing or sandbox */ }
+      if (locale && !isUsableBcp47Locale(locale)) locale = "";
     }
     if (!locale && (env.LC_TIME || env.LANG)) {
       const raw = (env.LC_TIME || env.LANG || "").split(".")[0];
       if (raw) locale = raw.replace(/_/g, "-");
+      // POSIX locale identifiers (`C`, `POSIX`) survive the simple extraction
+      // above but blow up `new Intl.DateTimeFormat(locale, ...)`. Drop and
+      // fall through to the host-default branch below.
+      if (locale && !isUsableBcp47Locale(locale)) locale = "";
     }
     if (!locale) {
       try {
@@ -1547,7 +1917,12 @@ export function detectLocaleAndTz(): { locale: string; tz: string } {
       tz = new Intl.DateTimeFormat().resolvedOptions().timeZone;
     } catch { tz = "UTC"; }
   }
-  return { locale: locale || "en-US", tz: tz || "UTC" };
+  // Final belt-and-suspenders: if the locale we settled on is somehow still
+  // unusable (env mutation between detection and return, contributor adding
+  // a new extraction path that skips the validator), fall back to en-US so
+  // formatLocalDateTime / monthDay / weekdayCap never throw at render time.
+  if (!isUsableBcp47Locale(locale)) locale = "en-US";
+  return { locale, tz: tz || "UTC" };
 }
 
 /**
@@ -1581,11 +1956,11 @@ function shortPath(abs: string): string {
  * the section disappears cleanly on a fresh install.
  *
  * Math constants:
- *   Opus 4   = $15.00 per 1M input tokens (matches OPUS_INPUT_PRICE_PER_TOKEN)
- *   Sonnet 4 = $3.00  per 1M input tokens
- *   GPT-4o   = $2.50  per 1M input tokens
- *   Gemini 2 = $1.25  per 1M input tokens
- *   Haiku 4  = $0.80  per 1M input tokens
+ *   Opus 4.7/4.8 = $5.00 per 1M input tokens (fallback when PI_CONTEXT_MODE_PRICE_OUTPUT_PER_TOKEN not set)
+ *   Sonnet 4.6   = $3.00 per 1M input tokens
+ *   GPT-4o       = $2.50 per 1M input tokens
+ *   Gemini 2     = $1.25 per 1M input tokens
+ *   Haiku 4.5    = $1.00 per 1M input tokens
  *   Cursor Pro       = $20  / month  → "X months of Cursor Pro"
  *   Claude Max       = $200 / month  → "X.X months of Claude Max"
  *   Weekend coding   ≈ $73.67        → "X weekends of nonstop API coding"
@@ -1598,36 +1973,55 @@ export function renderCostExample(
 ): string[] {
   if (!Number.isFinite(lifetimeTokens) || lifetimeTokens <= 0) return [];
 
-  const opusUsd = (lifetimeTokens * 15) / 1_000_000;
+  const lifetimeUsd = lifetimeTokens * pricePerToken();
   const usdStr  = (n: number, dp: number = 2): string => n.toFixed(dp);
 
   // Comparison units — kept locally so they're easy to tune without touching
   // the renderer logic. Cursor Pro & Claude Max are public list prices; the
   // weekend constant is an intentional approximation calibrated to make
   // $1399.73 → "19 weekends" line up with the demo target.
-  const cursorMonths     = Math.round(opusUsd / 20);
-  const claudeMaxMonths  = (opusUsd / 200).toFixed(1);
-  const weekendCount     = Math.round(opusUsd / 73.67);
-  const teamUsd          = Math.round(opusUsd * 10);
+  const cursorMonths     = Math.round(lifetimeUsd / 20);
+  const claudeMaxMonths  = (lifetimeUsd / 200).toFixed(1);
+  const weekendCount     = Math.round(lifetimeUsd / 73.67);
+  const teamUsd          = Math.round(lifetimeUsd * 10);
   const teamYearUsd      = lifetimeDays > 0
-    ? Math.round((opusUsd * 10) / lifetimeDays * 365)
+    ? Math.round((lifetimeUsd * 10) / lifetimeDays * 365)
     : 0;
 
   // Alternate-model scale row — same token count, different per-1M rates.
-  const sonnetUsd = ((lifetimeTokens * 3.0)  / 1_000_000).toFixed(2);
-  const gpt4oUsd  = ((lifetimeTokens * 2.5)  / 1_000_000).toFixed(2);
-  const geminiUsd = ((lifetimeTokens * 1.25) / 1_000_000).toFixed(2);
-  const haikuUsd  = ((lifetimeTokens * 0.8)  / 1_000_000).toFixed(2);
+  // (Kept for internal reference but unreachable per Mert directive.)
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const _sonnetUsd = ((lifetimeTokens * 3.0)  / 1_000_000).toFixed(2);
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const _gpt4oUsd  = ((lifetimeTokens * 2.5)  / 1_000_000).toFixed(2);
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const _geminiUsd = ((lifetimeTokens * 1.25) / 1_000_000).toFixed(2);
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const _haikuUsd  = ((lifetimeTokens * 1.0)  / 1_000_000).toFixed(2);
+
+  const usingDynamicPrice =
+    process.env.PI_CONTEXT_MODE_PRICE_OUTPUT_PER_TOKEN !== undefined;
+  const modelId = process.env.PI_CONTEXT_MODE_MODEL_ID;
 
   // Mert: "daha marketing ve business value e vermeli, math hesaplamalari ile
-  // kalabalik yapma" — collapse the old 4-block render (5 prose lines + 3
-  // comparison lines + 2 team lines + scaling table + disclaimer) into ONE
-  // headline number, ONE relatable comparison, ONE team-scale callout. Drop
-  // the alternate-model scaling row (engineer-curiosity, not value framing).
+  // kalabalik yapma" — collapse the old 4-block render into ONE headline
+  // number, ONE relatable comparison, ONE team-scale callout.
   const out: string[] = [];
-  out.push(
-    `  $${usdStr(opusUsd)} of Opus 4 tokens your team didn't burn.`,
-  );
+
+  if (usingDynamicPrice && modelId) {
+    out.push(
+      `  $${usdStr(lifetimeUsd)} of ${modelId} tokens your team didn't burn.`,
+    );
+  } else if (usingDynamicPrice) {
+    out.push(
+      `  $${usdStr(lifetimeUsd)} of tokens your team didn't burn.`,
+    );
+  } else {
+    out.push(
+      `  $${usdStr(lifetimeUsd)} of Opus 4.7 tokens your team didn't burn.`,
+    );
+  }
+
   out.push(
     `  context-mode kept ${kb(lifetimeBytes)} out of context — that's ${cursorMonths} months of Cursor Pro paid for itself.`,
   );
@@ -1637,10 +2031,13 @@ export function renderCostExample(
       `  Scale across a 10-dev team and that's ~$${teamYearUsd.toLocaleString("en-US")}/year saved.`,
     );
   }
-  out.push("");
-  out.push(
-    `  (Opus rates shown for context. On cheaper models the dollar number drops; the savings ratio holds.)`,
-  );
+
+  if (!usingDynamicPrice) {
+    out.push("");
+    out.push(
+      `  (Opus rates shown for context. On cheaper models the dollar number drops; the savings ratio holds.)`,
+    );
+  }
   return out;
 }
 
@@ -1691,7 +2088,16 @@ function renderNarrative5Section(args: {
   const lifetimeLegacyTokens = lifetimeEventsTokens + lifetimeRescueTokens;
   const lifetimeRealTokens   = realBytes?.lifetime?.totalSavedTokens ?? 0;
   const lifetimeTokensWithout = Math.max(lifetimeLegacyTokens, lifetimeRealTokens);
-  const lifetimeTokensWith    = Math.max(1, Math.round(lifetimeTokensWithout * 0.02));
+  // Lifetime "with" — measured when available, else legacy 0.02 fallback.
+  // Honest definition (matches conversation bar below):
+  //   "with"    = bytes_returned (what the model actually re-saw)
+  //   "without" = bytes_returned + bytes_avoided
+  // When the schema has measurement, derive `with` from `bytes_returned/4`.
+  const lifeRet = realBytes?.lifetime?.bytesReturned ?? 0;
+  const lifeAv  = realBytes?.lifetime?.bytesAvoided  ?? 0;
+  const lifetimeTokensWith = (lifeRet + lifeAv) > 0
+    ? Math.max(1, Math.floor(lifeRet / 4))
+    : Math.max(1, Math.round(lifetimeTokensWithout * 0.02));
 
   // Bytes from realBytes when present, else derive from tokens (×4 — same
   // ratio Phase 8 uses everywhere). All-work bytes drives the opener tally
@@ -1764,15 +2170,55 @@ function renderNarrative5Section(args: {
   }
   out.push("");
 
-  // Without/With bars — the screenshottable proof for THIS conversation.
-  const convTokensWith = Math.max(1, Math.round(conversationTokens * 0.02));
-  const withoutBar = dataBar(conversationTokens, conversationTokens, 32);
-  const withBar    = dataBar(convTokensWith,     conversationTokens, 32);
-  const convPct    = conversationTokens > 0 ? (1 - convTokensWith / conversationTokens) * 100 : 0;
-  out.push(`  Without context-mode  ${kb(convBytes).padStart(8)}  ${withoutBar}   ${fmtNum(conversationTokens).padStart(7)} tokens`);
-  out.push(`  With context-mode     ${kb(Math.max(1, Math.round(convBytes * 0.02))).padStart(8)}  ${withBar}   ${fmtNum(convTokensWith).padStart(7)} tokens`);
-  out.push(`                          ${convPct.toFixed(0)}% kept out of context · your AI ran ${Math.max(1, Math.round(conversationTokens / convTokensWith))}× longer before /compact fired`);
-  out.push("");
+  // Without/With bars — strict compression (v1.0.148, Bug G / ADR-0004).
+  //
+  // Honest definitions:
+  //   Without = bytes the model WOULD have re-seen if context-mode
+  //             had not diverted them
+  //           = bytesAvoided + bytesReturned
+  //   With    = bytes the model ACTUALLY re-saw after context-mode
+  //           = max(1, bytesReturned)
+  //
+  // Why eventDataBytes is excluded from this ratio:
+  //   `eventDataBytes` is the raw hook payload (tool args, prompt
+  //   body) we captured for the knowledge base. Those bytes are
+  //   analytics infrastructure — they NEVER enter the model context
+  //   window. Including them on either side (as v1.0.134 SLICE B did
+  //   to dodge a degenerate 100% bar) misrepresents context cost.
+  //   SLICE B was an incidental fix that crushed the displayed
+  //   percentage from ~95% (the true compression ratio) to ~56% on
+  //   live conversations. eventDataBytes is rendered in Section 2
+  //   (captures count), not in this Section 1 Without/With bar.
+  //
+  // Empty-state branch:
+  //   If neither bytesAvoided nor bytesReturned has been measured yet
+  //   (early in a session, schema-migration recovery in progress, or
+  //   tool-heavy work that hasn't re-hit the index), we do NOT draw
+  //   a degenerate 0% / 100% bar. We emit one honest hint line and
+  //   skip the bar — honesty over decoration.
+  const realConv = realBytes?.conversation;
+  const measuredAvoided  = realConv?.bytesAvoided   ?? 0;
+  const measuredReturned = realConv?.bytesReturned  ?? 0;
+
+  if (measuredAvoided + measuredReturned === 0) {
+    // No measurable redirect activity yet — captures may exist, but
+    // nothing has been diverted from the model context window.
+    out.push("  No measurable redirect activity captured yet — bars will appear once context-mode diverts its first payload.");
+    out.push("");
+  } else {
+    const convBytesWithout  = measuredAvoided + measuredReturned;
+    const convBytesWith     = Math.max(1, measuredReturned);
+    const convTokensWithout = Math.max(1, Math.floor(convBytesWithout / 4));
+    const convTokensWith    = Math.max(1, Math.floor(convBytesWith    / 4));
+    const withoutBar = dataBar(convTokensWithout, convTokensWithout, 32);
+    const withBar    = dataBar(convTokensWith,    convTokensWithout, 32);
+    const convPct    = (1 - convTokensWith / convTokensWithout) * 100;
+    const convMult   = Math.max(1, Math.round(convTokensWithout / convTokensWith));
+    out.push(`  Without context-mode  ${kb(convBytesWithout).padStart(8)}  ${withoutBar}   ${fmtNum(convTokensWithout).padStart(7)} tokens`);
+    out.push(`  With context-mode     ${kb(convBytesWith).padStart(8)}  ${withBar}   ${fmtNum(convTokensWith).padStart(7)} tokens`);
+    out.push(`                          ${convPct.toFixed(1)}% kept out of context · your AI ran ${convMult}× longer before /compact fired`);
+    out.push("");
+  }
 
   // Timeline — drop-in if conversation has byDay.
   if (conversation.byDay && conversation.byDay.length > 0) {
@@ -2033,13 +2479,49 @@ function fmtNum(n: number): string {
 // Pricing (Bug #6) — Anthropic Opus input rate
 // ─────────────────────────────────────────────────────────
 
-/** Opus 4 input price: $15 per 1M tokens. */
-export const OPUS_INPUT_PRICE_PER_TOKEN = 15 / 1_000_000;
+// ── Pricing (Bug #6) — per-token USD rate ─────────────────
+// Reads PI_CONTEXT_MODE_PRICE_OUTPUT_PER_TOKEN when set by a Pi host;
+// falls back to the Opus 4.7/4.8 input rate ($5/1M) for all other adapters.
+// Verified against platform.claude.com/docs/en/about-claude/pricing 2026-06.
+//
+// IMPORTANT: this is a FUNCTION, not a const. Pi sets the env var
+// AFTER the MCP server has been imported (the bridge spawns the server
+// child, then the child reads its own env on every render). A
+// module-load-time const would freeze to the fallback because
+// process.env.PI_CONTEXT_MODE_PRICE_OUTPUT_PER_TOKEN is unset at
+// import time. Resolving on every call keeps the dynamic-pricing
+// contract honest — the env var works without an MCP restart.
+// (Reverted module-load const semantics, PR #741 follow-up.)
 
-/** Convert a token count to a USD string at the Opus input rate. */
+/**
+ * Per-token USD rate — resolves on every call.
+ * Dynamic when PI_CONTEXT_MODE_PRICE_OUTPUT_PER_TOKEN is set, Opus 4.7/4.8 input
+ * ($5 per 1M tokens) otherwise.
+ */
+export function pricePerToken(): number {
+  const env = process.env.PI_CONTEXT_MODE_PRICE_OUTPUT_PER_TOKEN;
+  if (env !== undefined && env !== "") {
+    const parsed = Number(env);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return 5 / 1_000_000; // Opus 4.7/4.8 input fallback
+}
+
+/**
+ * Back-compat alias for the original Opus-rate const (PR #401 architect
+ * P1.1 — single source of truth). Kept as a literal so any third-party
+ * consumer importing the named constant still resolves to the same
+ * fallback rate. New code should call pricePerToken() to pick up the
+ * dynamic Pi env override.
+ *
+ * @deprecated Use pricePerToken() to honor PI_CONTEXT_MODE_PRICE_OUTPUT_PER_TOKEN.
+ */
+export const OPUS_INPUT_PRICE_PER_TOKEN = 5 / 1_000_000;
+
+/** Convert a token count to a USD string at the current per-token rate. */
 export function tokensToUsd(tokens: number): string {
   const safe = Number.isFinite(tokens) && tokens > 0 ? tokens : 0;
-  return `$${(safe * OPUS_INPUT_PRICE_PER_TOKEN).toFixed(2)}`;
+  return `$${(safe * pricePerToken()).toFixed(2)}`;
 }
 
 /**
@@ -2286,8 +2768,9 @@ function renderConversation(c: ConversationStats, conversationUsd: string, contr
  */
 function renderMultiAdapter(multiAdapter: MultiAdapterLifetimeStats | undefined): string[] {
   if (!multiAdapter) return [];
-  const real     = multiAdapter.perAdapter.filter((a) => a.isReal);
-  const skipped  = multiAdapter.perAdapter.filter((a) => !a.isReal);
+  const real: typeof multiAdapter.perAdapter = [];
+  const skipped: typeof multiAdapter.perAdapter = [];
+  for (const a of multiAdapter.perAdapter) (a.isReal ? real : skipped).push(a);
   if (real.length === 0 && skipped.length === 0) return [];
 
   const out: string[] = [];
@@ -2377,6 +2860,12 @@ export function formatReport(
      * single-adapter renderer output unchanged.
      */
     multiAdapter?: MultiAdapterLifetimeStats;
+    /**
+     * Point-in-time snapshot of the persistent content store. Optional —
+     * callers that don't have store access can omit it and the renderer
+     * skips the observability section gracefully.
+     */
+    indexState?: IndexState;
     /**
      * 5-section narrative renderer overrides. Defaults to ambient
      * `process.cwd()` + `Date.now()` + `detectLocaleAndTz()` for production

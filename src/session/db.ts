@@ -12,8 +12,282 @@ import type { SessionEvent } from "../types.js";
 import type { ProjectAttribution } from "./project-attribution.js";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { existsSync, realpathSync, renameSync } from "node:fs";
-import { join } from "node:path";
+import { accessSync, constants, existsSync, mkdirSync, realpathSync, renameSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+
+// ─────────────────────────────────────────────────────────
+// Storage root resolution
+// ─────────────────────────────────────────────────────────
+//
+// This lives beside the session DB path helpers because packaged hooks and the
+// statusline already consume `hooks/session-db.bundle.mjs` as their no-build
+// runtime bridge. Keeping the storage resolver here avoids adding a second
+// generated hook bundle just to share CONTEXT_MODE_DIR behavior.
+
+const STORAGE_ROOT_ENV = "CONTEXT_MODE_DIR" as const;
+const STORAGE_SESSIONS_SUBDIR = "sessions";
+const STORAGE_CONTENT_SUBDIR = "content";
+
+export type StorageDirectoryKind = "session" | "content" | "stats";
+export type StorageOverrideEnvVar = typeof STORAGE_ROOT_ENV;
+export type StorageDirectorySource = "default" | "override";
+export type IgnoredStorageOverrideReason = "empty";
+
+export interface ResolvedStorageDir {
+  kind: StorageDirectoryKind;
+  path: string;
+  envVar: StorageOverrideEnvVar | null;
+  source: StorageDirectorySource;
+  ignoredEnvVar?: StorageOverrideEnvVar;
+  ignoredReason?: IgnoredStorageOverrideReason;
+}
+
+export class StorageDirectoryError extends Error {
+  readonly kind: StorageDirectoryKind;
+  readonly path: string;
+  readonly overrideEnvVar: StorageOverrideEnvVar;
+  readonly ignoredEnvVar?: StorageOverrideEnvVar;
+  readonly ignoredReason?: IgnoredStorageOverrideReason;
+
+  constructor(
+    kind: StorageDirectoryKind,
+    path: string,
+    overrideEnvVar: StorageOverrideEnvVar = STORAGE_ROOT_ENV,
+    cause?: unknown,
+    message?: string,
+    metadata: Pick<ResolvedStorageDir, "ignoredEnvVar" | "ignoredReason"> = {},
+  ) {
+    super(message ?? storageDirectoryErrorMessage(kind, path, metadata), { cause });
+    this.name = "StorageDirectoryError";
+    this.kind = kind;
+    this.path = path;
+    this.overrideEnvVar = overrideEnvVar;
+    this.ignoredEnvVar = metadata.ignoredEnvVar;
+    this.ignoredReason = metadata.ignoredReason;
+  }
+}
+
+type OverrideRoot =
+  | { kind: "unset" }
+  | { kind: "ignored-empty"; ignoredEnvVar: StorageOverrideEnvVar; ignoredReason: IgnoredStorageOverrideReason }
+  | { kind: "override"; root: string };
+
+const writableStorageCache = new Map<string, string | StorageDirectoryError>();
+
+export interface DefaultSessionDirOptions {
+  configDir: string;
+  configDirEnv?: string;
+  legacySessionDirEnv?: string;
+  onLegacySessionDir?: (envVar: string, dir: string) => void;
+  env?: NodeJS.ProcessEnv;
+}
+
+export function resolveDefaultSessionDir(opts: DefaultSessionDirOptions): string {
+  const env = opts.env ?? process.env;
+  const legacyEnvVar = opts.legacySessionDirEnv;
+  const legacy = legacyEnvVar ? env[legacyEnvVar]?.trim() : undefined;
+  if (legacy && legacyEnvVar) {
+    opts.onLegacySessionDir?.(legacyEnvVar, legacy);
+    return legacy;
+  }
+
+  return join(resolveConfigDirForDefaultSession(opts.configDir, opts.configDirEnv, env), "context-mode", "sessions");
+}
+
+function resolveConfigDirForDefaultSession(
+  configDir: string,
+  configDirEnv: string | undefined,
+  env: NodeJS.ProcessEnv,
+): string {
+  const envValue = configDirEnv ? env[configDirEnv] : undefined;
+  if (envValue && envValue.trim() !== "") {
+    return resolveConfigDirValue(envValue.trim());
+  }
+  return resolveConfigDirValue(configDir, homedir());
+}
+
+function resolveConfigDirValue(value: string, baseDir?: string): string {
+  if (value.startsWith("~")) return resolve(homedir(), value.replace(/^~[/\\]?/, ""));
+  if (isAbsolute(value)) return resolve(value);
+  return baseDir ? resolve(baseDir, value) : resolve(value);
+}
+
+function invalidStorageOverride(kind: StorageDirectoryKind, path: string, detail: string): StorageDirectoryError {
+  return new StorageDirectoryError(
+    kind,
+    path,
+    STORAGE_ROOT_ENV,
+    undefined,
+    [`Invalid ${STORAGE_ROOT_ENV} for context-mode ${kind} directory: ${detail}`, storageDirectoryHint()].join("\n"),
+  );
+}
+
+function storageOverrideRoot(kind: StorageDirectoryKind): OverrideRoot {
+  const raw = process.env[STORAGE_ROOT_ENV];
+  if (raw === undefined) return { kind: "unset" };
+
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return { kind: "ignored-empty", ignoredEnvVar: STORAGE_ROOT_ENV, ignoredReason: "empty" };
+  }
+  if (!isAbsolute(trimmed)) {
+    throw invalidStorageOverride(kind, trimmed, `${STORAGE_ROOT_ENV} must be an absolute path.`);
+  }
+
+  return { kind: "override", root: resolve(trimmed) };
+}
+
+function ignoredStorageMetadata(root: OverrideRoot): Pick<ResolvedStorageDir, "ignoredEnvVar" | "ignoredReason"> {
+  return root.kind === "ignored-empty"
+    ? { ignoredEnvVar: root.ignoredEnvVar, ignoredReason: root.ignoredReason }
+    : {};
+}
+
+function overrideStorageDir(kind: StorageDirectoryKind, subdir: string): ResolvedStorageDir | null {
+  const root = storageOverrideRoot(kind);
+  if (root.kind !== "override") return null;
+
+  return {
+    kind,
+    path: join(root.root, subdir),
+    envVar: STORAGE_ROOT_ENV,
+    source: "override",
+  };
+}
+
+function defaultStorageDir(
+  kind: StorageDirectoryKind,
+  getDefaultDir: () => string,
+  metadata: Pick<ResolvedStorageDir, "ignoredEnvVar" | "ignoredReason">,
+): ResolvedStorageDir {
+  return {
+    kind,
+    path: resolve(getDefaultDir()),
+    envVar: null,
+    source: "default",
+    ...metadata,
+  };
+}
+
+export function resolveSessionStorageDir(getDefaultDir: () => string): ResolvedStorageDir {
+  const root = storageOverrideRoot("session");
+  if (root.kind === "override") {
+    return {
+      kind: "session",
+      path: join(root.root, STORAGE_SESSIONS_SUBDIR),
+      envVar: STORAGE_ROOT_ENV,
+      source: "override",
+    };
+  }
+
+  return defaultStorageDir("session", getDefaultDir, ignoredStorageMetadata(root));
+}
+
+export function resolveContentStorageDir(getSessionDir: () => string): ResolvedStorageDir {
+  const override = overrideStorageDir("content", STORAGE_CONTENT_SUBDIR);
+  if (override) return override;
+
+  const session = resolveSessionStorageDir(getSessionDir);
+  return {
+    kind: "content",
+    path: join(dirname(session.path), STORAGE_CONTENT_SUBDIR),
+    envVar: session.envVar,
+    source: session.source,
+    ignoredEnvVar: session.ignoredEnvVar,
+    ignoredReason: session.ignoredReason,
+  };
+}
+
+export function resolveStatsStorageDir(getDefaultSessionDir: () => string): ResolvedStorageDir {
+  const override = overrideStorageDir("stats", STORAGE_SESSIONS_SUBDIR);
+  if (override) return override;
+
+  const session = resolveSessionStorageDir(getDefaultSessionDir);
+  return {
+    kind: "stats",
+    path: session.path,
+    envVar: session.envVar,
+    source: session.source,
+    ignoredEnvVar: session.ignoredEnvVar,
+    ignoredReason: session.ignoredReason,
+  };
+}
+
+export function formatStorageDirectoryError(err: StorageDirectoryError): string {
+  return err.message;
+}
+
+export function describeStorageDirectorySource(dir: ResolvedStorageDir): string {
+  if (dir.source === "override" && dir.envVar) return `via ${dir.envVar}`;
+  if (dir.ignoredEnvVar && dir.ignoredReason === "empty") return `default; ignored empty ${dir.ignoredEnvVar}`;
+  return "default";
+}
+
+export function clearStorageDirectoryCheckCacheForTests(): void {
+  writableStorageCache.clear();
+}
+
+export function ensureWritableStorageDir(dir: ResolvedStorageDir): string {
+  const key = [
+    dir.kind,
+    dir.path,
+    dir.source,
+    dir.envVar ?? "",
+    dir.ignoredEnvVar ?? "",
+    dir.ignoredReason ?? "",
+  ].join("\0");
+  const cached = writableStorageCache.get(key);
+  if (cached instanceof StorageDirectoryError) throw cached;
+  if (cached === dir.path) return cached;
+
+  try {
+    mkdirSync(dir.path, { recursive: true });
+    accessSync(dir.path, constants.W_OK);
+    writableStorageCache.set(key, dir.path);
+    return dir.path;
+  } catch (err) {
+    const storageErr = new StorageDirectoryError(
+      dir.kind,
+      pathFromStorageError(err) ?? dir.path,
+      STORAGE_ROOT_ENV,
+      err,
+      undefined,
+      { ignoredEnvVar: dir.ignoredEnvVar, ignoredReason: dir.ignoredReason },
+    );
+    writableStorageCache.set(key, storageErr);
+    throw storageErr;
+  }
+}
+
+function storageDirectoryErrorMessage(
+  kind: StorageDirectoryKind,
+  path: string,
+  metadata: Pick<ResolvedStorageDir, "ignoredEnvVar" | "ignoredReason"> = {},
+): string {
+  return [
+    `context-mode ${kind} directory is not writable: ${path}`,
+    ignoredStorageOverrideHint(metadata),
+    storageDirectoryHint(),
+  ].filter(Boolean).join("\n");
+}
+
+function ignoredStorageOverrideHint(metadata: Pick<ResolvedStorageDir, "ignoredEnvVar" | "ignoredReason">): string | null {
+  if (metadata.ignoredEnvVar && metadata.ignoredReason === "empty") {
+    return `Ignored empty ${metadata.ignoredEnvVar}; using adapter default.`;
+  }
+  return null;
+}
+
+function storageDirectoryHint(): string {
+  return `Set ${STORAGE_ROOT_ENV} to a writable absolute path.`;
+}
+
+function pathFromStorageError(err: unknown): string | null {
+  if (!err || typeof err !== "object") return null;
+  const path = (err as { path?: unknown }).path;
+  return typeof path === "string" && path.length > 0 ? path : null;
+}
 
 // ─────────────────────────────────────────────────────────
 // Worktree isolation
@@ -315,6 +589,34 @@ export interface SessionMeta {
   compact_count: number;
 }
 
+/**
+ * Session rollup snapshot (seed-parity aggregate).
+ *
+ * 12 fields that mirror the platform's `session_summary` + `session_metadata`
+ * stamps from src/routes/seed.ts. Each outgoing canonical event carries
+ * this snapshot computed at the moment of forward so the analytics engine
+ * can run its SUM/AVG/MAX rollups across per-event rows.
+ */
+export interface SessionRollup {
+  tool_calls: number;
+  errors: number;
+  unique_tools: number;
+  unique_files: number;
+  max_file_edits: number;
+  has_commit: 0 | 1;
+  // v1.0.161 (Bug 2): latest commit subject from this session's type='git_commit'
+  // events — stamped onto every outgoing event via the rollup spread so
+  // has_commit=1 rows always carry a meaningful commit_message. Empty string
+  // when the session has no commit events yet.
+  commit_message: string;
+  edit_test_cycles: number;
+  duration_min: number;
+  compact_count: number;
+  sources_indexed: number;
+  total_chunks: number;
+  search_queries: number;
+}
+
 /** Resume snapshot row from the session_resume table. */
 export interface ResumeRow {
   snapshot: string;
@@ -368,7 +670,12 @@ const S = {
   updateMetaLastEvent: "updateMetaLastEvent",
   ensureSession: "ensureSession",
   getSessionStats: "getSessionStats",
+  getSessionRollup: "getSessionRollup",
+  getMaxFileEdits: "getMaxFileEdits",
+  getLatestCommitMessage: "getLatestCommitMessage",
   incrementCompactCount: "incrementCompactCount",
+  getUsageCursor: "getUsageCursor",
+  setUsageCursor: "setUsageCursor",
   upsertResume: "upsertResume",
   getResume: "getResume",
   markResumeConsumed: "markResumeConsumed",
@@ -383,6 +690,98 @@ const S = {
   getToolCallByTool: "getToolCallByTool",
   getEventBytesSummary: "getEventBytesSummary",
 } as const;
+
+// ─────────────────────────────────────────────────────────
+// Schema migration helpers (shared with the analytics aggregator)
+// ─────────────────────────────────────────────────────────
+
+/**
+ * Columns that the current `session_events` schema requires but earlier
+ * versions of context-mode did not write. Older DBs on disk are missing
+ * these — the analytics aggregator opens every DB it finds across all
+ * adapters, so without an in-place migration the SUM queries below fail
+ * the entire DB (the catch at the top of the read loop swallows the
+ * "no such column" error and the DB contributes zero to every column,
+ * not just the new ones). v1.0.148 hotfix.
+ */
+const SESSION_EVENTS_REQUIRED_COLUMNS: ReadonlyArray<readonly [string, string]> = [
+  ["project_dir", "TEXT NOT NULL DEFAULT ''"],
+  ["attribution_source", "TEXT NOT NULL DEFAULT 'unknown'"],
+  ["attribution_confidence", "REAL NOT NULL DEFAULT 0"],
+  ["bytes_avoided", "INTEGER NOT NULL DEFAULT 0"],
+  ["bytes_returned", "INTEGER NOT NULL DEFAULT 0"],
+];
+
+/**
+ * Apply any missing post-v1.0.130 `session_events` columns to an already-
+ * open writable database handle. Idempotent — each ALTER is guarded by a
+ * PRAGMA table_xinfo check, and the project_dir index is created only
+ * when a migration actually ran. Returns true if any column was added.
+ *
+ * Used by both the SessionDB constructor (for the active DB) and the
+ * analytics aggregator (for the 100+ historical DBs that never get
+ * opened through SessionDB). ADR-0001 compatible: no EXCLUSIVE pragma,
+ * no acquireDbLock — relies on the SQLite busy_timeout + WAL semantics
+ * already provided by SQLiteBase.
+ */
+export function applyMissingSessionEventsColumns(db: {
+  pragma: (q: string) => Array<{ name: string }>;
+  exec: (sql: string) => void;
+}): boolean {
+  const colInfo = db.pragma("table_xinfo(session_events)") as Array<{ name: string }>;
+  const cols = new Set(colInfo.map((c) => c.name));
+  let changed = false;
+  for (const [name, spec] of SESSION_EVENTS_REQUIRED_COLUMNS) {
+    if (!cols.has(name)) {
+      db.exec(`ALTER TABLE session_events ADD COLUMN ${name} ${spec}`);
+      changed = true;
+    }
+  }
+  if (changed) {
+    db.exec(
+      "CREATE INDEX IF NOT EXISTS idx_session_events_project ON session_events(session_id, project_dir)",
+    );
+  }
+  return changed;
+}
+
+/**
+ * Open a session DB file briefly, run any missing schema migrations,
+ * and close. Best-effort: missing tables, file-locks, corrupt files,
+ * and any DatabaseCtor error are swallowed silently — the caller
+ * (analytics aggregator) handles the readonly query that follows and
+ * will skip the DB if it remains unreadable.
+ *
+ * Lazy migration entry point for the analytics aggregator, which would
+ * otherwise read 100+ historical DBs with the old (pre-v1.0.130) schema
+ * and lose every signal (not just bytes_avoided) because the SELECT
+ * statement references columns that don't exist on legacy schemas.
+ *
+ * Two open/close cycles in the worst case (one readonly probe to detect
+ * legacy schema, one writable to migrate). For already-migrated DBs
+ * (the common case after first read), this opens writable once and
+ * exits without writing — cheaper than always-writable.
+ */
+export function ensureSessionEventsSchema(
+  dbPath: string,
+  DatabaseCtor: new (path: string, opts?: { readonly?: boolean }) => {
+    pragma: (q: string) => Array<{ name: string }>;
+    exec: (sql: string) => void;
+    close: () => void;
+  },
+): void {
+  let db: { pragma: (q: string) => Array<{ name: string }>; exec: (sql: string) => void; close: () => void } | null = null;
+  try {
+    db = new DatabaseCtor(dbPath);
+    applyMissingSessionEventsColumns(db);
+  } catch {
+    // best-effort — missing table, file lock, corrupt DB, or DatabaseCtor
+    // load failure. The aggregator's existing skip-on-error handles the
+    // downstream readonly query.
+  } finally {
+    try { db?.close(); } catch { /* ignore */ }
+  }
+}
 
 // ─────────────────────────────────────────────────────────
 // SessionDB
@@ -478,25 +877,27 @@ export class SessionDB extends SQLiteBase {
     `);
 
     // Migration: add per-event attribution columns for existing DBs.
+    // Shared helper — the analytics aggregator (analytics.ts) runs the
+    // SAME migration against every historical DB it scans, so the column
+    // list lives in one place at the top of this module.
     try {
-      const colInfo = this.db.pragma("table_xinfo(session_events)") as Array<{ name: string }>;
-      const cols = new Set(colInfo.map((c) => c.name));
-      if (!cols.has("project_dir")) {
-        this.db.exec("ALTER TABLE session_events ADD COLUMN project_dir TEXT NOT NULL DEFAULT ''");
+      applyMissingSessionEventsColumns(this.db as unknown as {
+        pragma: (q: string) => Array<{ name: string }>;
+        exec: (sql: string) => void;
+      });
+    } catch {
+      // best-effort migration only
+    }
+
+    // Migration: per-session usage high-water cursor for the Stop hook's
+    // cursor-aware main-turn capture (extractTranscriptUsageSince). Stores the
+    // uuid of the last assistant turn already emitted so the next Stop forwards
+    // only NEW spend. Idempotent — guarded by a table_xinfo column check.
+    try {
+      const metaCols = this.db.pragma("table_xinfo(session_meta)") as Array<{ name: string }>;
+      if (!metaCols.some((c) => c.name === "usage_cursor")) {
+        this.db.exec("ALTER TABLE session_meta ADD COLUMN usage_cursor TEXT");
       }
-      if (!cols.has("attribution_source")) {
-        this.db.exec("ALTER TABLE session_events ADD COLUMN attribution_source TEXT NOT NULL DEFAULT 'unknown'");
-      }
-      if (!cols.has("attribution_confidence")) {
-        this.db.exec("ALTER TABLE session_events ADD COLUMN attribution_confidence REAL NOT NULL DEFAULT 0");
-      }
-      if (!cols.has("bytes_avoided")) {
-        this.db.exec("ALTER TABLE session_events ADD COLUMN bytes_avoided INTEGER NOT NULL DEFAULT 0");
-      }
-      if (!cols.has("bytes_returned")) {
-        this.db.exec("ALTER TABLE session_events ADD COLUMN bytes_returned INTEGER NOT NULL DEFAULT 0");
-      }
-      this.db.exec("CREATE INDEX IF NOT EXISTS idx_session_events_project ON session_events(session_id, project_dir)");
     } catch {
       // best-effort migration only
     }
@@ -585,8 +986,59 @@ export class SessionDB extends SQLiteBase {
       `SELECT session_id, project_dir, started_at, last_event_at, event_count, compact_count
        FROM session_meta WHERE session_id = ?`);
 
+    // ── Session rollup (seed-parity aggregator) ────────────────────────
+    // Single query producing 9 of the 12 platform-side session_summary +
+    // session_metadata fields. Computed against the local SessionDB
+    // session_events table at forward time so every outgoing canonical
+    // event carries a session-wide snapshot at that moment — matches the
+    // seed.ts shape where each event row has tool_calls/errors/etc. stamped.
+    // max_file_edits and edit_test_cycles need separate GROUP BY queries
+    // (below). compact_count is read from session_meta (already in getSessionStats).
+    p(S.getSessionRollup,
+      `SELECT
+         COUNT(*) AS tool_calls,
+         COALESCE(SUM(CASE WHEN category = 'error' THEN 1 ELSE 0 END), 0) AS errors,
+         COUNT(DISTINCT type) AS unique_tools,
+         COUNT(DISTINCT CASE WHEN category = 'file' THEN data END) AS unique_files,
+         CASE WHEN SUM(CASE WHEN type = 'git_commit' THEN 1 ELSE 0 END) > 0 THEN 1 ELSE 0 END AS has_commit,
+         CAST(COALESCE((MAX(strftime('%s', created_at)) - MIN(strftime('%s', created_at))) / 60.0, 0) AS INTEGER) AS duration_min,
+         COALESCE(SUM(CASE WHEN type = 'external_ref' THEN 1 ELSE 0 END), 0) AS sources_indexed,
+         CAST(COALESCE(SUM(bytes_avoided) / 1024.0, 0) AS INTEGER) AS total_chunks,
+         COALESCE(SUM(CASE WHEN type IN ('file_search', 'file_glob') THEN 1 ELSE 0 END), 0) AS search_queries
+       FROM session_events
+       WHERE session_id = ?`);
+
+    // max_file_edits: max edits on any single file path in the session.
+    // Two-level aggregation — GROUP BY data first, then MAX of those counts.
+    p(S.getMaxFileEdits,
+      `SELECT COALESCE(MAX(c), 0) AS max_file_edits
+       FROM (
+         SELECT COUNT(*) AS c
+         FROM session_events
+         WHERE session_id = ? AND category = 'file' AND type IN ('file_edit', 'file_write')
+         GROUP BY data
+       )`);
+
+    // v1.0.161 (Bug 2): latest commit message from session's type='git_commit'
+    // events. Used by rollup spread to stamp commit_message symmetric with
+    // has_commit on every outgoing event. Separate prepared statement (vs.
+    // sub-select in getSessionRollup) keeps the binding shape uniform — every
+    // rollup query takes a single sessionId parameter.
+    p(S.getLatestCommitMessage,
+      `SELECT data
+       FROM session_events
+       WHERE session_id = ? AND type = 'git_commit'
+       ORDER BY id DESC
+       LIMIT 1`);
+
     p(S.incrementCompactCount,
       `UPDATE session_meta SET compact_count = compact_count + 1 WHERE session_id = ?`);
+
+    p(S.getUsageCursor,
+      `SELECT usage_cursor FROM session_meta WHERE session_id = ?`);
+
+    p(S.setUsageCursor,
+      `UPDATE session_meta SET usage_cursor = ? WHERE session_id = ?`);
 
     // ── Resume ──
     p(S.upsertResume,
@@ -634,7 +1086,7 @@ export class SessionDB extends SQLiteBase {
     p(S.searchEvents,
       `SELECT id, session_id, category, type, data, created_at
        FROM session_events
-       WHERE project_dir = ?
+       WHERE (project_dir = ? OR project_dir = '')
          AND (data LIKE '%' || ? || '%' ESCAPE '\\' OR category LIKE '%' || ? || '%' ESCAPE '\\')
          AND (? IS NULL OR category = ?)
        ORDER BY id ASC
@@ -698,7 +1150,7 @@ export class SessionDB extends SQLiteBase {
     const projectDir = String(
       attribution?.projectDir
       ?? event.project_dir
-      ?? "",
+      ?? this._getSessionProjectDir(sessionId),
     ).trim();
     const attributionSource = String(
       attribution?.source
@@ -786,9 +1238,14 @@ export class SessionDB extends SQLiteBase {
         .slice(0, 16)
         .toUpperCase();
       const attribution = attributions?.[i];
-      const projectDir = String(
-        attribution?.projectDir ?? event.project_dir ?? "",
+      // #827: store project_dir in canonical path shape so the search-time
+      // allow-set lookup (getSessionIdsForProject) matches regardless of the
+      // separator / trailing-slash form the host adapter happened to emit.
+      // normalizeWorktreePath is the same rule used for project-hash stability.
+      const rawProjectDir = String(
+        attribution?.projectDir ?? event.project_dir ?? this._getSessionProjectDir(sessionId) ?? "",
       ).trim();
+      const projectDir = rawProjectDir === "" ? "" : normalizeWorktreePath(rawProjectDir);
       const attributionSource = String(
         attribution?.source ?? event.attribution_source ?? "unknown",
       );
@@ -905,6 +1362,20 @@ export class SessionDB extends SQLiteBase {
   }
 
   /**
+   * Look up the project_dir from session_meta as a last-resort fallback
+   * for event attribution. Prevents project_dir='' orphans when the caller
+   * (e.g. pi adapter) omits the attribution parameter.
+   */
+  _getSessionProjectDir(sessionId: string): string {
+    try {
+      const row = this.db.prepare("SELECT project_dir FROM session_meta WHERE session_id = ?").get(sessionId) as { project_dir: string } | undefined;
+      return row?.project_dir || "";
+    } catch {
+      return "";
+    }
+  }
+
+  /**
    * Search events by text query scoped to a project directory.
    *
    * Performs a case-insensitive LIKE search across the `data` and `category`
@@ -949,6 +1420,47 @@ export class SessionDB extends SQLiteBase {
     }
   }
 
+  /**
+   * Return the distinct list of session ids whose events were attributed
+   * to a given `project_dir`. Powers the ctx_search `project:` filter
+   * (#737) via the 2-step IN-clause strategy — ATTACH DATABASE is avoided
+   * because SQLite's WAL + ATTACH combination has known correctness
+   * trade-offs flagged in the upstream docs.
+   *
+   * Backed by the `idx_session_events_project(session_id, project_dir)`
+   * composite index, so 1000-session lookups complete in single-digit
+   * milliseconds. Best-effort: returns `[]` on any error.
+   */
+  getSessionIdsForProject(projectDir: string): string[] {
+    try {
+      // #827: match by canonical path shape, not raw bytes. The host adapter
+      // may store `project_dir` in a different separator / trailing-slash
+      // shape than the search path resolves the scope in — most visibly on
+      // Windows, where attribution often carries `C:\Users\me\proj` while the
+      // server resolves `C:/Users/me/proj`. An exact `project_dir = ?` match
+      // then returned an EMPTY allow-set and ctx_search reported "No results
+      // found" even though the content was present. We fold BOTH sides through
+      // the same canonical rule used for project-hash stability
+      // (normalizeWorktreePath): backslash → forward slash, then strip the
+      // trailing slash. Normalizing in SQL (RTRIM(REPLACE(...))) covers rows
+      // already written un-normalized without a migration, while the JS-side
+      // normalize keeps the bound parameter in the identical shape. This
+      // preserves the #737 project scope — distinct directories still differ
+      // after normalization, so cross-project isolation is intact.
+      const normalized = normalizeWorktreePath(projectDir);
+      const rows = this.db
+        .prepare(
+          `SELECT DISTINCT session_id
+             FROM session_events
+            WHERE RTRIM(REPLACE(project_dir, '\\', '/'), '/') = ?`,
+        )
+        .all(normalized) as Array<{ session_id: string }>;
+      return rows.map((r) => r.session_id);
+    } catch {
+      return [];
+    }
+  }
+
   // ═══════════════════════════════════════════
   // Meta
   // ═══════════════════════════════════════════
@@ -970,10 +1482,74 @@ export class SessionDB extends SQLiteBase {
   }
 
   /**
+   * Session rollup snapshot — 12 aggregate fields the analytics platform
+   * stamps onto every outgoing event row (seed.ts shape parity).
+   *
+   * Called from session-loaders BEFORE `maybeForward`; the snapshot is
+   * computed against the LOCAL SessionDB and threaded into the canonical
+   * event so the platform-side Zod schema receives the rich shape without
+   * the bridge ever hand-mapping fields (PRD §5.4 ABI passthrough).
+   *
+   * Returns zeroed defaults for unknown sessions — callers MUST tolerate
+   * a snapshot from an empty session (first event into a fresh DB).
+   */
+  getSessionRollup(sessionId: string): SessionRollup {
+    const main = this.stmt(S.getSessionRollup).get(sessionId) as Partial<SessionRollup> | undefined;
+    const maxRow = this.stmt(S.getMaxFileEdits).get(sessionId) as { max_file_edits?: number } | undefined;
+    const commitRow = this.stmt(S.getLatestCommitMessage).get(sessionId) as { data?: string } | undefined;
+    const meta = this.getSessionStats(sessionId);
+
+    // edit_test_cycles: heuristic — min(file edits, errors) approximates
+    // the number of edit-then-test attempts in a session. Exact pattern
+    // detection (consecutive file_edit followed by error_tool) would need
+    // a windowed query; this scalar pair under-counts but never overshoots.
+    const fileEdits =
+      ((main as { tool_calls?: number })?.tool_calls ?? 0) > 0
+        ? ((main as { unique_files?: number })?.unique_files ?? 0)
+        : 0;
+    const errors = (main as { errors?: number })?.errors ?? 0;
+    const editTestCycles = Math.min(fileEdits, errors);
+
+    return {
+      tool_calls: main?.tool_calls ?? 0,
+      errors: main?.errors ?? 0,
+      unique_tools: main?.unique_tools ?? 0,
+      unique_files: main?.unique_files ?? 0,
+      max_file_edits: maxRow?.max_file_edits ?? 0,
+      has_commit: main?.has_commit ?? 0,
+      commit_message: commitRow?.data ?? "",
+      edit_test_cycles: editTestCycles,
+      duration_min: main?.duration_min ?? 0,
+      compact_count: meta?.compact_count ?? 0,
+      sources_indexed: main?.sources_indexed ?? 0,
+      total_chunks: main?.total_chunks ?? 0,
+      search_queries: main?.search_queries ?? 0,
+    };
+  }
+
+  /**
    * Increment the compact_count for a session (tracks snapshot rebuilds).
    */
   incrementCompactCount(sessionId: string): void {
     this.stmt(S.incrementCompactCount).run(sessionId);
+  }
+
+  /**
+   * Read the per-session usage high-water cursor — the uuid of the last
+   * assistant turn already emitted by the Stop hook's main-turn capture.
+   * Returns null when unset (first Stop) or the session row is absent.
+   */
+  getUsageCursor(sessionId: string): string | null {
+    const row = this.stmt(S.getUsageCursor).get(sessionId) as { usage_cursor: string | null } | undefined;
+    return row?.usage_cursor ?? null;
+  }
+
+  /**
+   * Advance the per-session usage high-water cursor to `uuid`. No-op when the
+   * session_meta row does not exist yet (callers ensureSession first).
+   */
+  setUsageCursor(sessionId: string, uuid: string): void {
+    this.stmt(S.setUsageCursor).run(uuid, sessionId);
   }
 
   // ═══════════════════════════════════════════
@@ -1126,5 +1702,25 @@ export class SessionDB extends SQLiteBase {
     }
 
     return oldSessions.length;
+  }
+
+  /**
+   * Delete event rows whose session_id has no matching session_meta row.
+   *
+   * Orphaned events accumulate when meta rows were aged out by an older
+   * version of `cleanupOldSessions` but the matching events were left
+   * behind (or when callers wrote events without a meta upsert). The Kimi
+   * Code sessionstart hook calls this on every startup as a self-healing
+   * step; surfacing it as a SessionDB method keeps the SQL definition in
+   * one place instead of letting hook scripts reach through to
+   * `db.db.exec(...)` and re-encode schema knowledge in mjs files.
+   */
+  pruneOrphanedEvents(): number {
+    const result = this.db
+      .prepare(
+        `DELETE FROM session_events WHERE session_id NOT IN (SELECT session_id FROM session_meta)`,
+      )
+      .run();
+    return Number(result.changes ?? 0);
   }
 }

@@ -26,30 +26,13 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { existsSync, readFileSync } from "node:fs";
 
 import { resolveSessionDbPath, SessionDB } from "../../session/db.js";
-import { extractEvents, extractUserEvents } from "../../session/extract.js";
+import { extractEvents, extractUserEvents, parseOpencodeUsage, buildAgentUsageEvent } from "../../session/extract.js";
 import type { HookInput } from "../../session/extract.js";
 import { buildResumeSnapshot } from "../../session/snapshot.js";
 import type { SessionEvent } from "../../types.js";
 import { AdapterPlatformType, OpenCodeAdapter } from "./index.js";
 import { PLATFORM_ENV_VARS } from "../detect.js";
-
-// Read package.json version once at module load (not on every hook call).
-// Used in the resume-injection visible signal so users can confirm in
-// OPENCODE_DEBUG logs which plugin version actually injected.
-const VERSION: string = (() => {
-  try {
-    const pkgRoot = dirname(fileURLToPath(import.meta.url));
-    // Search both the legacy depths (when bundled flat under build/) and
-    // the post-refactor depths (when compiled to build/adapters/opencode/).
-    // `../../../package.json` is the canonical location after the
-    // `src/opencode-plugin.ts → src/adapters/opencode/plugin.ts` move.
-    for (const rel of ["../../../package.json", "../package.json", "./package.json"]) {
-      const p = resolve(pkgRoot, rel);
-      if (existsSync(p)) return JSON.parse(readFileSync(p, "utf8")).version ?? "unknown";
-    }
-  } catch { /* fall through */ }
-  return "unknown";
-})();
+import { zod3ShapeToV4 } from "./zod3tov4.js";
 
 // ── Types ─────────────────────────────────────────────────
 
@@ -83,6 +66,25 @@ type PluginContext = {
   directory: string;
 };
 
+type NativeToolContext = {
+  sessionID: string;
+  messageID: string;
+  agent: string;
+  directory: string;
+  worktree?: string;
+  abort?: AbortSignal;
+  metadata?: (input: { title?: string; metadata?: Record<string, unknown> }) => void;
+};
+
+type NativeToolDefinition = {
+  description: string;
+  args: Record<string, unknown>;
+  execute: (
+    args: Record<string, unknown>,
+    ctx: NativeToolContext,
+  ) => Promise<string | { title?: string; output: string; metadata?: Record<string, unknown> }>;
+};
+
 /** OpenCode tool.execute.before — first parameter */
 interface BeforeHookInput {
   tool: string;
@@ -108,6 +110,19 @@ interface AfterHookOutput {
   title: string;
   output: string;
   metadata: any;
+}
+
+/**
+ * OpenCode generic bus `event` hook — single parameter.
+ * The plugin SDK delivers every bus Event here (refs/platforms/opencode/
+ * packages/plugin/src/index.ts:224). We narrow to `message.updated`, whose
+ * `properties.info` is the full assistant Message carrying tokens/cost/modelID.
+ */
+interface EventHookInput {
+  event?: {
+    type?: string;
+    properties?: { info?: { sessionID?: string } & Record<string, unknown> };
+  };
 }
 
 /** OpenCode experimental.session.compacting — first parameter */
@@ -228,7 +243,7 @@ function systemHasRoutingInstructions(system: string[]): boolean {
 function getPlatform(): AdapterPlatformType {
   for (const [platform, vars] of PLATFORM_ENV_VARS) {
     if (platform !== "kilo" && platform !== "opencode") continue;
-    if (vars.some((v) => process.env[v])) {
+    if (vars.some((v) => process.env[v.name])) {
       return platform as AdapterPlatformType;
     }
   }
@@ -370,7 +385,103 @@ async function createContextModePlugin(ctx: PluginContext) {
     }
   }
 
+  async function buildNativeTools(): Promise<Record<string, NativeToolDefinition>> {
+    // Import the existing MCP server registry without starting its stdio
+    // transport. This is the plugin-only bridge for #574: OpenCode/Kilo
+    // call ctx_* tools in-process through Hooks.tool instead of spawning
+    // a separate MCP child per session.
+    const prevEmbedded = process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS;
+    process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS = "1";
+    let mod: typeof import("../../server.js");
+    try {
+      mod = await import("../../server.js");
+    } finally {
+      if (prevEmbedded === undefined) delete process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS;
+      else process.env.CONTEXT_MODE_EMBEDDED_PLUGIN_TOOLS = prevEmbedded;
+    }
+    const tools: Record<string, NativeToolDefinition> = {};
+
+    for (const registered of mod.REGISTERED_CTX_TOOLS) {
+      const config = registered.config as Record<string, unknown>;
+      // Zod schema object that the MCP framework normally calls
+      // safeParseAsync() on before invoking the handler. The native
+      // OpenCode plugin path bypasses MCP's transport layer entirely
+      // (refs/platforms/opencode/packages/opencode/src/tool/registry.ts:127),
+      // so we must parse args here too — otherwise z.preprocess() coercions
+      // (coerceCommandsArray / coerceJsonArray in server.ts) and defaults
+      // never fire. Fixes #621.
+      const inputSchema = config.inputSchema as
+        | { shape?: unknown; _def?: { shape?: unknown }; parse?: (input: unknown) => unknown }
+        | undefined;
+      const shape =
+        typeof inputSchema?.shape === "object" && inputSchema.shape !== null
+          ? inputSchema.shape
+          : typeof inputSchema?._def?.shape === "function"
+            ? (inputSchema._def.shape as () => unknown)()
+            : {};
+
+      // Both KiloCode and recent OpenCode bundle Zod v4 in-host; v3 schemas
+      // crash with `n._zod.def` undefined. Gate widened from kilo-only (#632)
+      // because every consumer of this file is an OpenCode-family host.
+      const argsForHost = zod3ShapeToV4(shape as Record<string, unknown>);
+
+      tools[registered.name] = {
+        description: String(config.description ?? ""),
+        args: argsForHost,
+        async execute(args: Record<string, unknown>, toolCtx: NativeToolContext) {
+          toolCtx.metadata?.({ title: String(config.title ?? registered.name) });
+          const project = toolCtx.directory || projectDir;
+
+          // Run the registered Zod schema BEFORE the handler — same contract
+          // as the MCP SDK (server/mcp.js safeParseAsync at line 174). This
+          // applies z.preprocess() coercions, populates .default() values,
+          // and produces the validation error the handler expects (#621).
+          let parsedArgs: Record<string, unknown> = args ?? {};
+          if (typeof inputSchema?.parse === "function") {
+            try {
+              parsedArgs = inputSchema.parse(args ?? {}) as Record<string, unknown>;
+            } catch (err) {
+              // Surface validation failures with a clear, actionable message
+              // (mirrors MCP SDK error format) instead of a downstream
+              // "x.map is not a function" crash.
+              const message = err instanceof Error ? err.message : String(err);
+              throw new Error(
+                `Invalid arguments for ${registered.name}: ${message}`,
+              );
+            }
+          }
+
+          const result = await mod.withProjectDirOverride({ projectDir: project, sessionId: toolCtx.sessionID }, async () =>
+            registered.handler(parsedArgs),
+          );
+
+          const r = result as {
+            content?: Array<{ type?: string; text?: string }>;
+            isError?: boolean;
+          };
+          const text = Array.isArray(r?.content)
+            ? r.content
+                .filter((c) => c?.type === "text" && typeof c.text === "string")
+                .map((c) => c.text)
+                .join("\n")
+            : typeof result === "string"
+              ? result
+              : JSON.stringify(result ?? "");
+
+          if (r?.isError) throw new Error(text || `${registered.name} returned an error`);
+          return { title: String(config.title ?? registered.name), output: text };
+        },
+      };
+    }
+
+    return tools;
+  }
+
+  const nativeTools = await buildNativeTools();
+
   return {
+    tool: nativeTools,
+
     // ── PreToolUse: Routing enforcement ─────────────────
 
     "tool.execute.before": async (input: BeforeHookInput, output: BeforeHookOutput) => {
@@ -427,6 +538,43 @@ async function createContextModePlugin(ctx: PluginContext) {
         }
       } catch {
         // Silent — session capture must never break the tool call
+      }
+    },
+
+    // ── event: per-turn token + cost capture (paid-observability) ───
+    // The generic bus `event` hook (refs/platforms/opencode/packages/plugin/
+    // src/index.ts:224) delivers every Event; we filter `message.updated`
+    // (published on each assistant-message update incl. step-finish —
+    // session.ts:673) and read tokens/cost/modelID off properties.info
+    // (assistant filter via role; refs stream.transport.ts:214-216).
+    //
+    // CAVEAT (refs processor.ts:717-718): message-level `.tokens` is the LAST
+    // step's snapshot (overwritten per step-finish), while `.cost` is
+    // cumulative for the turn. parseOpencodeUsage passes `.cost` through as
+    // native_cost_usd so the billed $ stays exact despite the token snapshot
+    // being last-step only. `message.updated` fires multiple times per turn;
+    // because tokens are a terminal snapshot and cost is cumulative, the last
+    // event for a message carries the final figures — re-emitting on each
+    // update is idempotent at the cost column and merely refreshes the
+    // last-step token telemetry. db.insertEvent both persists locally AND
+    // forwards to the platform (the TS-plugin equivalent of the .mjs
+    // attributeAndInsertEvents path).
+    event: async (input: EventHookInput) => {
+      try {
+        const ev = input?.event;
+        if (!ev || ev.type !== "message.updated") return;
+        const sessionId = ev.properties?.info?.sessionID;
+        if (!sessionId || typeof sessionId !== "string") return;
+
+        const counts = parseOpencodeUsage(ev);
+        if (!counts) return;
+        const usageEvent = buildAgentUsageEvent(counts);
+        if (!usageEvent) return;
+
+        db.ensureSession(sessionId, projectDir);
+        db.insertEvent(sessionId, usageEvent, "MessageUpdated");
+      } catch {
+        // Silent — usage capture must never break the session.
       }
     },
 

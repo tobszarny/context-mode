@@ -20,7 +20,7 @@ context-mode uses a flat `src/` structure:
 src/
   server.ts        → MCP server, tool handlers, auto-indexing
   store.ts         → FTS5 content store (index, search, chunking)
-  executor.ts      → Polyglot code executor (11 languages)
+  executor.ts      → Polyglot code executor (12 languages)
   security.ts      → Permission enforcement (deny/allow rules)
   runtime.ts       → Runtime detection (Node, Bun, Python, etc.)
   db-base.ts       → SQLite base class (shared by store + session)
@@ -80,6 +80,10 @@ LLM               → searches source:"session-events" for details on demand
 
 Raw session events are **never injected into context**. Only a compact summary table + search queries are injected. The LLM searches for details via the existing `ctx_search()` MCP tool.
 
+### Multi-writer contract (v1.0.130 — see [docs/adr/0001-sessiondb-multi-writer.md](docs/adr/0001-sessiondb-multi-writer.md))
+
+Both SessionDB and ContentStore are **multi-writer-safe**. Two processes may open the same on-disk dbPath simultaneously — that is the legitimate multi-window UX shape. Write contention is handled by `withRetry()` on top of SQLite's built-in `busy_timeout` (30000ms). Do NOT add `acquireDbLock`-style file locks or `locking_mode = EXCLUSIVE` pragmas to `SQLiteBase` or `applyWALPragmas`. Process-identity invariants (one MCP per project) live in `src/util/sibling-mcp.ts`, not the DB layer.
+
 ## Prerequisites
 
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed
@@ -135,7 +139,7 @@ The symlink in step 2 ensures `hooks.json` (which registers PostToolUse, PreComp
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash|Read|Grep|WebFetch|Agent|mcp__plugin_context-mode_context-mode__ctx_execute|mcp__plugin_context-mode_context-mode__ctx_execute_file|mcp__plugin_context-mode_context-mode__ctx_batch_execute",
+        "matcher": "Bash|Read|Grep|WebFetch|Agent|mcp__plugin_context-mode_context-mode__ctx_execute|mcp__plugin_context-mode_context-mode__ctx_execute_file|mcp__plugin_context-mode_context-mode__ctx_batch_execute|mcp__(?!plugin_context-mode_)",
         "hooks": [
           {
             "type": "command",
@@ -293,6 +297,8 @@ npx skills add https://github.com/mksglu/context-mode/tree/main/.claude/skills/c
 | VS Code hooks | `tests/hooks/vscode-hooks.test.ts` |
 | JetBrains hooks | `tests/hooks/jetbrains-hooks.test.ts` |
 | Kiro hooks | `tests/hooks/kiro-hooks.test.ts` |
+| Copilot CLI hooks | `tests/hooks/copilot-cli-hooks.test.ts` |
+| Antigravity CLI hooks | `tests/hooks/antigravity-cli-hooks.test.ts` |
 | Session DB | `tests/session/session-db.test.ts` |
 | Session extract | `tests/session/session-extract.test.ts` |
 | Session snapshot | `tests/session/session-snapshot.test.ts` |
@@ -357,6 +363,27 @@ context-mode does not dictate how the model writes its final answer. The four pi
 The regression test at `tests/core/server.test.ts > prose-style policy (#482)` pins the deletion: any caveman-style language landing in `src/server.ts`, `hooks/routing-block.mjs`, or `README.md` will fail CI.
 
 If you genuinely need to nudge the model on style for a specific use case, do it in your own project's `CLAUDE.md` / `AGENTS.md`. Don't ship it inside the framework.
+
+## For Pi developers
+
+context-mode works on Pi now. The extension injects routing rules, registers
+ctx_* tools through the MCP bridge, and the lean `configs/pi/AGENTS.md` keeps
+context budget tight.
+
+**First-time setup:** If you open this project in Pi before running `npm install`
+and `npm run build`, you will see errors. That's normal — the extension needs
+the compiled server bundle. Run the build once and restart.
+
+- If you use Pi: remove `CLAUDE.md` from your project root. Pi.dev reads both
+  CLAUDE.md and AGENTS.md, burning double context on duplicated routing
+  instructions the extension already injects.
+- Use `ctx_search` to recall decisions, errors, and blockers from prior
+  sessions instead of re-reading raw files.
+- Use `ctx_insight` for personal analytics — session activity, tool usage,
+  error rate, project focus.
+
+For the full local dev workflow, build commands, and test instructions, see
+[the contributing guide above](#contributing-to-context-mode).
 
 ## Submitting a Bug Report
 

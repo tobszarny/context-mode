@@ -43,6 +43,13 @@ const _hashCanonical = (p: string) => createHash("sha256").update(
 
 const STATUSLINE = resolve(process.cwd(), "bin", "statusline.mjs");
 
+// Statusline subprocess on windows-latest runner walks git worktrees and reads
+// SessionDB analytics with a 1000-row seed; observed p99 ≈ 265s under runner
+// load. Mac/Linux finish in <2s — keep the budget tight off-Windows so real
+// regressions still trip the test.
+const STATUSLINE_SQLITE_TIMEOUT_MS =
+  process.platform === "win32" ? 300_000 : 30_000;
+
 // Isolate the spawned statusline's env so getMultiAdapterLifetimeStats()
 // (and OpenCode's APPDATA/XDG_CONFIG_HOME paths on Windows) cannot leak data
 // from concurrently-running tests or the developer's real adapter dirs into
@@ -55,9 +62,9 @@ function isolatedHomeEnv(): Record<string, string> {
   return buildIsolatedEnvObject().env;
 }
 
-function runStatusline(env: Record<string, string>) {
+function runStatusline(env: Record<string, string>, input = "{}") {
   const result = spawnSync("node", [STATUSLINE], {
-    input: "{}",
+    input,
     env: { ...process.env, NO_COLOR: "1", ...isolatedHomeEnv(), ...env },
     encoding: "utf-8",
   });
@@ -159,23 +166,25 @@ function seedSessionDb(opts: {
 }
 
 describe("statusline.mjs — SessionDB-backed reads", () => {
+  let root: string;
   let dir: string;
 
   beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), "ctx-statusline-sqlite-"));
+    root = mkdtempSync(join(tmpdir(), "ctx-statusline-sqlite-"));
+    dir = join(root, "sessions");
+    mkdirSync(dir, { recursive: true });
   });
 
   afterEach(() => {
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
   });
 
   // SLICE 1: lifetime $ comes from SessionDB, not from sidecar JSON.
   // Seed a SessionDB with substantial event data → statusline must render
   // a lifetime $ derived from those bytes (NOT $0.00, NOT a stale sidecar).
-  // 60s timeout: Windows fork+exec + 1000-row SQLite seed + statusline subprocess
-  // (which walks git worktrees + reads SessionDB analytics) regularly takes >30s
-  // on the windows-latest runner. Mac/Linux finish in <2s.
-  test("renders lifetime $ from SessionDB session_events bytes", { timeout: 60_000 }, () => {
+  // Per-platform timeout via STATUSLINE_SQLITE_TIMEOUT_MS — Windows runner is
+  // ~130× slower than mac/linux on this fork+exec+SQLite-seed pipeline.
+  test("renders lifetime $ from SessionDB session_events bytes", { timeout: STATUSLINE_SQLITE_TIMEOUT_MS }, () => {
     // 1000 events × ~256 bytes data = ~256KB → ~64K tokens → ~$0.96
     // Use bytes_avoided so it counts as keptOut savings.
     const events = Array.from({ length: 1000 }, () => ({
@@ -185,7 +194,7 @@ describe("statusline.mjs — SessionDB-backed reads", () => {
     seedSessionDb({ dir, events });
 
     const { stdout } = runStatusline({
-      CONTEXT_MODE_SESSION_DIR: dir,
+      CONTEXT_MODE_DIR: root,
       CLAUDE_SESSION_ID: "any-session-id",
     });
 
@@ -206,11 +215,71 @@ describe("statusline.mjs — SessionDB-backed reads", () => {
     assert.doesNotMatch(stdout, /NaN/);
   });
 
+  // REGRESSION (#statusline-session-id): the per-session "this chat" KPI must
+  // resolve from the stdin payload's `session_id`. Claude Code does NOT export
+  // a CLAUDE_SESSION_ID env var (statusline.md "Available data" — session_id is
+  // delivered only in the stdin JSON), and the recording hooks key
+  // session_events by that same id. Reading only the env var / PID walk yields
+  // `pid-<n>`, which never matches → sessionBytes is always 0 → the bar shows
+  // only the global lifetime aggregate, identical in every session.
+  //
+  // Magnitude-based mutation-defeat: 'other' is deliberately ~60× larger than
+  // 'mine' (3000 vs 50 events). Two mutations turn this red:
+  //   • reverting resolveSessionId() to ignore the payload → "this chat"
+  //     disappears entirely (no KB match)
+  //   • dropping the sessionId filter in getRealBytesStats → "this chat"
+  //     absorbs 'other' and renders in MB, not KB
+  test("resolves per-session KPI from the stdin payload session_id (no env var)", { timeout: STATUSLINE_SQLITE_TIMEOUT_MS }, () => {
+    const sid = "11111111-2222-3333-4444-555555555555";
+    // Per-session bytes for THIS id…
+    const mine = Array.from({ length: 50 }, () => ({
+      sessionId: sid,
+      bytesAvoided: 1024,
+      data: "x".repeat(64),
+    }));
+    // …plus an unrelated session so lifetime > 0 regardless of the active id.
+    // Deliberately ~60× larger than 'mine' to make the magnitude check
+    // mutation-defeating: if the sessionId filter is dropped, "this chat"
+    // absorbs the combined total and renders in MB instead of KB.
+    const other = Array.from({ length: 3000 }, () => ({
+      sessionId: "99999999-aaaa-bbbb-cccc-dddddddddddd",
+      bytesAvoided: 1024,
+      data: "y".repeat(64),
+    }));
+    seedSessionDb({ dir, events: [...mine, ...other] });
+
+    // Production path: session_id arrives ONLY on stdin. CLAUDE_SESSION_ID is
+    // explicitly empty so the env branch cannot mask a broken payload read.
+    const { stdout } = runStatusline(
+      { CONTEXT_MODE_DIR: root, CLAUDE_SESSION_ID: "" },
+      JSON.stringify({ session_id: sid }),
+    );
+
+    assert.match(stdout, /context-mode/, "brand visible");
+    // The active session (mine, 50 events ≈ tens of KB) is ~60× smaller than
+    // the unrelated 'other' session (3000 events ≈ MB). So a correctly
+    // session-scoped "this chat" renders in KB. Two mutations turn this red:
+    //   • reverting resolveSessionId to ignore the payload → no "this chat" at all
+    //   • dropping the sessionId filter in getRealBytesStats → "this chat" absorbs
+    //     'other' and renders in MB
+    assert.match(
+      stdout,
+      /\d+(\.\d+)?\s*KB\s+this chat/,
+      "active-session KPI present and scoped to the small active session (KB)",
+    );
+    assert.doesNotMatch(
+      stdout,
+      /\bMB\s+this chat/,
+      "'this chat' must not include the large unrelated session's bytes",
+    );
+    assert.doesNotMatch(stdout, /NaN/);
+  });
+
   // SLICE 1 cont: no SessionDB → headline fallback (substantiated, no $).
   test("empty sessionsDir falls back to substantiated headline", () => {
     // dir exists but has no .db files
     const { stdout } = runStatusline({
-      CONTEXT_MODE_SESSION_DIR: dir,
+      CONTEXT_MODE_DIR: root,
       CLAUDE_SESSION_ID: "any-session-id",
     });
     assert.match(stdout, /context-mode/);
@@ -230,13 +299,15 @@ describe("statusline.mjs — SessionDB-backed reads", () => {
 // avg bytes >= 50 — see DEFAULT_REAL_USAGE_FILTER at analytics.ts:1162).
 describe("statusline.mjs — multi-adapter aggregation", () => {
   let home: string;
+  let claudeRoot: string;
   let claudeSessionsDir: string;
 
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), "ctx-statusline-multi-"));
     // Mirror real adapter layout: ~/.claude/context-mode/sessions for
     // claude-code, ~/.gemini/context-mode/sessions for gemini-cli, etc.
-    claudeSessionsDir = join(home, ".claude", "context-mode", "sessions");
+    claudeRoot = join(home, ".claude", "context-mode");
+    claudeSessionsDir = join(claudeRoot, "sessions");
     mkdirSync(claudeSessionsDir, { recursive: true });
     mkdirSync(join(home, ".gemini", "context-mode", "sessions"), {
       recursive: true,
@@ -303,9 +374,11 @@ describe("statusline.mjs — multi-adapter aggregation", () => {
 
   // Slice 2 RED: with TWO real adapters seeded under HOME, the statusline
   // surfaces the cross-tool aggregate. Counts adapters via "across N tools".
-  // 60s timeout for the same reason as the slice 1 test above — Windows is
-  // slow at fork+exec and the multi-adapter walk multiplies the cost.
-  test("renders 'across N tools' when 2+ real adapters detected", { timeout: 60_000 }, () => {
+  // Reuses STATUSLINE_SQLITE_TIMEOUT_MS (300s Windows / 30s elsewhere) for
+  // parity with the slice 1 test — Windows is slow at fork+exec and the
+  // multi-adapter walk multiplies the cost. The previously-hardcoded 60s
+  // tripped on Windows runner load (CI #401 observed 186s with retry x2).
+  test("renders 'across N tools' when 2+ real adapters detected", { timeout: STATUSLINE_SQLITE_TIMEOUT_MS }, () => {
     seedRealAdapter(join(home, ".claude", "context-mode", "sessions"), "claude");
     seedRealAdapter(join(home, ".gemini", "context-mode", "sessions"), "gemini");
 
@@ -314,7 +387,6 @@ describe("statusline.mjs — multi-adapter aggregation", () => {
       HOME: home,
       USERPROFILE: home,
       // active adapter dir is the claude one (matches getSessionDir() default)
-      CONTEXT_MODE_SESSION_DIR: claudeSessionsDir,
       CLAUDE_SESSION_ID: "any-session-id",
     });
 
@@ -333,7 +405,6 @@ describe("statusline.mjs — multi-adapter aggregation", () => {
     const { stdout } = runStatusline({
       HOME: home,
       USERPROFILE: home,
-      CONTEXT_MODE_SESSION_DIR: claudeSessionsDir,
       CLAUDE_SESSION_ID: "any-session-id",
     });
 

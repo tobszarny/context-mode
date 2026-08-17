@@ -13,7 +13,11 @@
  * MCP: full support via [mcp_servers] in $CODEX_HOME/config.toml.
  *
  * Known limitations:
- *   - PreToolUse: deny works, updatedInput not yet supported (openai/codex#18491)
+ *   - PreToolUse: deny works on all builds. permissionDecision:"allow" +
+ *     updatedInput (command rewrite) and additionalContext are honored on
+ *     codex-cli >= 0.141.0 (#845), detected at runtime by
+ *     hooks/core/codex-caps.mjs; older builds fail closed (redirect → deny).
+ *     `ask` remains unsupported.
  *   - PostToolUse: updatedMCPToolOutput parsed but logged as unsupported
  *   - PostToolUse does not fire on failing Bash calls (upstream bug)
  */
@@ -31,6 +35,29 @@ export const HOOK_TYPES = {
   USER_PROMPT_SUBMIT: "UserPromptSubmit",
   STOP: "Stop",
 } as const;
+
+// ─────────────────────────────────────────────────────────
+// External MCP routing matcher (#529)
+// ─────────────────────────────────────────────────────────
+
+/**
+ * External MCP catch-all matcher for Codex CLI (#529, #547 hotfix).
+ *
+ * Codex CLI's hook `tool_name` payload uses `mcp__<server>__<tool>` for any
+ * MCP-namespaced tool. Originally this constant used a negative lookahead
+ * `mcp__(?!.*context-mode)` to exclude context-mode's own MCP tools at the
+ * matcher layer. v1.0.124 shipped that pattern and Codex (Rust `regex` crate)
+ * rejected the matcher at boot with "look-around not supported", breaking
+ * every Codex user (#547).
+ *
+ * Fix: drop the lookaround. The matcher is now a charset-clean literal
+ * (`[A-Za-z0-9_|]` only), satisfying Codex's `is_exact_matcher`
+ * (refs/platforms/codex/codex-rs/hooks/src/events/common.rs:152) which
+ * short-circuits the regex engine entirely. context-mode's own MCP tools are
+ * already filtered in the hook BODY by `isExternalMcpTool()` in
+ * hooks/core/routing.mjs — semantics preserved.
+ */
+export const EXTERNAL_MCP_MATCHER_PATTERN = "mcp__";
 
 // ─────────────────────────────────────────────────────────
 // Routing instructions

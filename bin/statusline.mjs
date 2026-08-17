@@ -26,10 +26,14 @@
  */
 
 import { existsSync, readFileSync } from "node:fs";
-import { join, dirname, resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
+import {
+  ensureWritableStorageDir,
+  resolveDefaultSessionDir,
+  resolveSessionStorageDir,
+} from "../hooks/session-db.bundle.mjs";
 
 // ── Analytics import — resolved relative to this script ─────────────────
 // statusline.mjs ships in `bin/`; the compiled analytics module lives in
@@ -68,10 +72,10 @@ function platform() {
 
 // Single-shot stderr warning latch — keep noise out of Claude Code's
 // statusline output even when our parent runs us repeatedly per session.
-let __winWarned = false;
+const __warnedKeys = new Set();
 function warnOnce(key, msg) {
-  if (key === "win" && __winWarned) return;
-  if (key === "win") __winWarned = true;
+  if (__warnedKeys.has(key)) return;
+  __warnedKeys.add(key);
   try { process.stderr.write(`context-mode statusline: ${msg}\n`); } catch { /* ignore */ }
 }
 
@@ -92,16 +96,30 @@ function readStdinJson() {
     const raw = readFileSync(0, "utf-8");
     if (!raw.trim()) return {};
     return JSON.parse(raw);
-  } catch {
+  } catch (err) {
+    // The payload is load-bearing — it carries session_id, which resolves the
+    // per-session KPI. Empty stdin (normal first render) returned above and
+    // stays silent; a non-empty payload that fails to parse is a real anomaly
+    // worth one latched stderr line (never pollutes the statusline's stdout).
+    warnOnce("stdin-parse", `failed to parse statusline stdin JSON: ${err?.message ?? err}`);
     return {};
   }
 }
 
 function resolveSessionDir() {
-  if (process.env.CONTEXT_MODE_SESSION_DIR) {
-    return process.env.CONTEXT_MODE_SESSION_DIR;
-  }
-  return join(homedir(), ".claude", "context-mode", "sessions");
+  return ensureWritableStorageDir(
+    resolveSessionStorageDir(() => resolveDefaultSessionDir({
+      configDir: ".claude",
+      configDirEnv: "CLAUDE_CONFIG_DIR",
+      legacySessionDirEnv: "CONTEXT_MODE_SESSION_DIR",
+      onLegacySessionDir: () => {
+        warnOnce(
+          "legacy-session-dir",
+          "CONTEXT_MODE_SESSION_DIR is deprecated; set CONTEXT_MODE_DIR to the parent context-mode root.",
+        );
+      },
+    })),
+  );
 }
 
 /**
@@ -174,8 +192,23 @@ function findClaudePidDarwin() {
   return process.ppid;
 }
 
-function resolveSessionId() {
+function resolveSessionId(payload) {
+  // PRIMARY: the session_id Claude Code delivers in the statusLine stdin
+  // payload. This is the SAME id the recording hooks key session_events by,
+  // so it's the only source that reliably matches stored per-session data.
+  //
+  // Claude Code does NOT export a CLAUDE_SESSION_ID env var — session_id is
+  // delivered only in the stdin JSON (statusline.md "Available data"). And the
+  // /proc PID walk yields `pid-<n>`, which never matches a UUID-keyed session.
+  // So without reading the payload, the per-session KPI is unreachable and the
+  // bar falls back to the global lifetime aggregate — identical in every
+  // session and seemingly "frozen".
+  const fromPayload = payload?.session_id;
+  if (typeof fromPayload === "string" && fromPayload) return fromPayload;
+  // Fallback when the payload carries no session_id (and how test fixtures
+  // pin a deterministic id). NOT an override — payload wins when present.
   if (process.env.CLAUDE_SESSION_ID) return process.env.CLAUDE_SESSION_ID;
+  // Last resort: walk the process tree (only matches pid-keyed events).
   return `pid-${findClaudePid()}`;
 }
 
@@ -195,9 +228,9 @@ function statusDot(pct) {
 
 // ── Main render ──────────────────────────────────────────────────────────
 async function main() {
-  readStdinJson(); // drain stdin even if unused, keeps Claude Code happy
+  const payload = readStdinJson(); // canonical source of session_id
   const sessionsDir = resolveSessionDir();
-  const sessionId = resolveSessionId();
+  const sessionId = resolveSessionId(payload);
 
   const analytics = await loadAnalytics();
 

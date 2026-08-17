@@ -146,6 +146,30 @@ describe("Pi Extension", () => {
         tool_result: "ok",
       });
     });
+
+    it("maps 'context_mode_' prefix to 'mcp__context_mode__' so MCP tool calls get extracted", async () => {
+      await registerPiExtension(api);
+      await api._trigger("session_start", {
+        session_id: "test-fix1",
+        project_dir: tempDir,
+      });
+
+      // Pi prefixes MCP-registered tools with "context_mode_". Without
+      // normalisation the extract functions (P, F) silently drop all
+      // events because they gate on e.startsWith("mcp__").
+      await api._trigger("tool_result", {
+        tool_name: "context_mode_ctx_execute",
+        params: { language: "javascript", code: "console.log(1)" },
+        result: "1",
+      });
+
+      // Verify via ctx-stats that events include "mcp" category
+      // (meaning they were extracted, not just the generic fallback).
+      const stats = (await api._getCommand("ctx-stats")!.handler!({})) as {
+        text: string;
+      };
+      expect(stats.text).toContain("mcp");
+    });
   });
 
   // ═══════════════════════════════════════════════════════════
@@ -174,6 +198,31 @@ describe("Pi Extension", () => {
         tool_input: { file_path: "/src/index.ts" },
         tool_result: "export const hello = 'world';",
       });
+    });
+
+    it("extracts file_read event when Pi passes 'path' instead of 'file_path'", async () => {
+      await registerPiExtension(api);
+      await api._trigger("session_start", {
+        session_id: "test-fix2",
+        project_dir: tempDir,
+      });
+
+      // Pi's native Read tool sends { path: "..." } rather than
+      // { file_path: "..." } (Claude Code convention). Without
+      // normalisation the extractor reads n.file_path → undefined,
+      // producing file_read events with an empty path.
+      await api._trigger("tool_result", {
+        tool_name: "read",
+        params: { path: "/src/index.ts" },
+        result: "export const hello = 'world';",
+      });
+
+      // Verify the file_read event was captured by checking
+      // ctx-stats shows "file" category events.
+      const stats = (await api._getCommand("ctx-stats")!.handler!({})) as {
+        text: string;
+      };
+      expect(stats.text).toContain("file");
     });
 
     it("extracts cwd event from cd command", async () => {
@@ -278,6 +327,167 @@ describe("Pi Extension", () => {
       // Should not throw, and should passthrough
       if (result) {
         expect(result.blocked).not.toBe(true);
+      }
+    });
+
+    // ── Issue #625 — escape hatches + quoted-string false positives ──
+    //
+    // The original BLOCKED_BASH_PATTERNS blocked every curl/wget unconditionally
+    // and matched inside quoted CLI arguments. Two consequences:
+    //
+    //   1. False positive: `gh issue list --search "...curl..."` was blocked
+    //      because the literal word `curl` appeared inside the quoted search
+    //      argument. The reporter literally could not file the issue via `gh`
+    //      until they rephrased the query.
+    //
+    //   2. Unrecoverable trap: when the MCP bridge dies, the agent's only
+    //      escape hatch is a disk-buffered HTTP download (curl -s -o file).
+    //      With every curl/wget invocation blocked, there is no way to fetch
+    //      a URL until the user restarts Pi entirely.
+    //
+    // Fix mirrors hooks/core/routing.mjs:660–722:
+    //   - Strip quoted content before regex matching
+    //   - Split on chain operators (&&, ||, ;)
+    //   - Allow segments that are: silent (-s/-q) + file output (-o/-O or >)
+    //     + no verbose (-v) + no stdout alias (-o -, -o /dev/stdout)
+    //
+    // This preserves the original "do not flood context" intent while letting
+    // the agent gracefully self-recover when MCP is unreachable.
+
+    it("does NOT block gh command with 'curl' inside quoted --search argument (Issue #625 bonus)", async () => {
+      await registerPiExtension(api);
+
+      const result = await api._trigger("tool_call", {
+        toolName: "bash",
+        input: {
+          command: 'gh issue list --search "BLOCKED_BASH_PATTERNS curl wget block"',
+        },
+      });
+
+      // The literal word "curl" appears only inside a quoted argument; the
+      // command itself is `gh`, which has nothing to do with HTTP fetching.
+      // Stripping quoted content before matching must allow this through.
+      if (result) {
+        expect(result.block).not.toBe(true);
+      }
+    });
+
+    it("does NOT block echo with 'wget' inside a quoted log message (Issue #625 bonus)", async () => {
+      await registerPiExtension(api);
+
+      const result = await api._trigger("tool_call", {
+        toolName: "bash",
+        input: {
+          command: 'echo "users tried to wget the bundle and it failed"',
+        },
+      });
+
+      if (result) {
+        expect(result.block).not.toBe(true);
+      }
+    });
+
+    it("allows curl with silent + file output for MCP-down recovery (Issue #625)", async () => {
+      await registerPiExtension(api);
+
+      const result = await api._trigger("tool_call", {
+        toolName: "bash",
+        input: { command: "curl -s -o /tmp/data.json https://example.com/api" },
+      });
+
+      // -s (silent) + -o file means the body never enters context. This must
+      // remain available as an escape hatch when ctx_fetch_and_index is
+      // unreachable (e.g. MCP bridge dead between requests).
+      if (result) {
+        expect(result.block).not.toBe(true);
+      }
+    });
+
+    it("allows wget with quiet + output-document for MCP-down recovery (Issue #625)", async () => {
+      await registerPiExtension(api);
+
+      const result = await api._trigger("tool_call", {
+        toolName: "bash",
+        input: { command: "wget -q -O /tmp/data.json https://example.com/api" },
+      });
+
+      if (result) {
+        expect(result.block).not.toBe(true);
+      }
+    });
+
+    it("still blocks curl that would flood context (no file output)", async () => {
+      await registerPiExtension(api);
+
+      const result = await api._trigger("tool_call", {
+        toolName: "bash",
+        input: { command: "curl https://example.com/big-response" },
+      });
+
+      // No -o flag → body goes straight to stdout → straight into context.
+      // Must remain blocked.
+      expect(result).toBeDefined();
+      expect(result.block).toBe(true);
+    });
+
+    it("still blocks curl -o - (explicit stdout alias)", async () => {
+      await registerPiExtension(api);
+
+      const result = await api._trigger("tool_call", {
+        toolName: "bash",
+        input: { command: "curl -s -o - https://example.com/api" },
+      });
+
+      // -o - means stdout, which feeds context — must remain blocked even
+      // when silent flag is present.
+      expect(result).toBeDefined();
+      expect(result.block).toBe(true);
+    });
+
+    it("still blocks verbose curl (floods stderr → context)", async () => {
+      await registerPiExtension(api);
+
+      const result = await api._trigger("tool_call", {
+        toolName: "bash",
+        input: { command: "curl -v -s -o /tmp/x.json https://example.com" },
+      });
+
+      // -v dumps request/response headers to stderr — flooding context.
+      expect(result).toBeDefined();
+      expect(result.block).toBe(true);
+    });
+
+    it("blocks chained command if ANY segment is unsafe curl", async () => {
+      await registerPiExtension(api);
+
+      const result = await api._trigger("tool_call", {
+        toolName: "bash",
+        input: {
+          command:
+            "curl -s -o /tmp/a.json https://example.com/a && curl https://example.com/b",
+        },
+      });
+
+      // First segment safe, second unsafe → must block the whole chain.
+      expect(result).toBeDefined();
+      expect(result.block).toBe(true);
+    });
+
+    it("allows chained command where every curl segment is safe", async () => {
+      await registerPiExtension(api);
+
+      const result = await api._trigger("tool_call", {
+        toolName: "bash",
+        input: {
+          command:
+            "curl -s -o /tmp/a.json https://example.com/a && curl -s -o /tmp/b.json https://example.com/b",
+        },
+      });
+
+      // Both segments: silent + file output + no stdout alias + no verbose.
+      // The chain must pass.
+      if (result) {
+        expect(result.block).not.toBe(true);
       }
     });
   });
@@ -385,10 +595,13 @@ describe("Pi Extension", () => {
 
       // Verify the session was initialised with the file-derived ID by checking
       // that before_agent_start doesn't blow up (it needs a valid _sessionId).
+      // In the new behavior, before_agent_start no longer returns systemPrompt;
+      // it stores context in _pendingContext for the context hook to inject.
       const result = await api._trigger("before_agent_start", {
         systemPrompt: "Base.",
       });
-      expect(result?.systemPrompt).toBeDefined();
+      // before_agent_start may or may not return a value — the key is it doesn't throw
+      expect(result?.systemPrompt ?? null).toBe(null); // systemPrompt is no longer returned
     });
 
     it("handles session lifecycle in correct order", async () => {
@@ -424,7 +637,7 @@ describe("Pi Extension", () => {
   // ═══════════════════════════════════════════════════════════
 
   describe("Slice 5: Resume injection", () => {
-    it("returns modified systemPrompt when unconsumed resume exists", async () => {
+    it("delivers resume snapshot through context hook, not systemPrompt", async () => {
       await registerPiExtension(api);
 
       // Build up session state: capture events → compact → build resume
@@ -449,16 +662,73 @@ describe("Pi Extension", () => {
       await api._trigger("session_before_compact", {});
       await api._trigger("session_compact", {});
 
-      // Now before_agent_start should inject the resume
+      // before_agent_start should prepare context without mutating systemPrompt
       const result = await api._trigger("before_agent_start", {
         systemPrompt: "You are a helpful assistant.",
       });
+      expect(result?.systemPrompt ?? null).toBe(null);
 
-      // If resume injection is supported, the result should contain
-      // a modified system prompt with session_resume data
-      if (result?.systemPrompt) {
-        expect(result.systemPrompt).toContain("session_resume");
-      }
+      // The context hook should deliver the resume as a trailing user message.
+      const messages = [{ role: "system", content: "You are a helpful assistant." }];
+      const ctxResult = await api._trigger("context", { messages });
+
+      expect(ctxResult?.messages).toBe(messages);
+      expect(messages).toHaveLength(2);
+      expect(messages[0]).toEqual({
+        role: "system",
+        content: "You are a helpful assistant.",
+      });
+      expect(messages[1].role).toBe("user");
+      expect(String(messages[1].content)).toContain("session_resume");
+      expect(String(messages[1].content)).not.toContain("You are a helpful assistant.");
+    });
+
+    it("appends resume and active context after existing messages", async () => {
+      await registerPiExtension(api);
+
+      await api._trigger("session_start", {
+        session_id: "resume-test-2",
+        project_dir: tempDir,
+      });
+
+      await api._trigger("tool_result", {
+        tool_name: "read",
+        tool_input: { file_path: "/src/main.ts" },
+        tool_result: "export const value = 1;",
+      });
+
+      await api._trigger("tool_result", {
+        tool_name: "write",
+        tool_input: { file_path: "/src/main.ts", content: "export const value = 2;" },
+        tool_result: "wrote /src/main.ts",
+      });
+
+      await api._trigger("session_before_compact", {});
+      await api._trigger("session_compact", {});
+
+      const result = await api._trigger("before_agent_start", {
+        systemPrompt: "Stable system prompt.",
+        prompt: "Continue with the refactor and avoid lodash.",
+      });
+      expect(result?.systemPrompt ?? null).toBe(null);
+
+      const messages = [
+        { role: "system", content: "Stable system prompt." },
+        { role: "user", content: "Continue with the refactor." },
+      ];
+      const ctxResult = await api._trigger("context", { messages });
+
+      expect(ctxResult?.messages).toBe(messages);
+      expect(messages).toHaveLength(3);
+      expect(messages[0]).toEqual({ role: "system", content: "Stable system prompt." });
+      expect(messages[1]).toEqual({ role: "user", content: "Continue with the refactor." });
+      expect(messages[2].role).toBe("user");
+
+      const trailing = String(messages[2].content);
+      expect(trailing).toContain("context-mode active");
+      expect(trailing).toContain("session_resume");
+      expect(trailing).toContain("how_to_search");
+      expect(trailing).not.toContain("Stable system prompt.");
     });
 
     it("returns nothing when no resume exists", async () => {
@@ -578,13 +848,24 @@ describe("Pi Extension", () => {
           { sessionManager: { getSessionFile: () => sessionFile } },
         );
 
-        const dbPath = join(
+        // Issue #645 — Pi extension now resolves the SessionDB file
+        // through `resolveSessionDbPath`, the same helper the MCP
+        // server uses. The shared "context-mode.db" literal is gone;
+        // the file lives at <canonical-hash>.db (case-folded on
+        // darwin/win32, worktree-suffixed when applicable). Mirror
+        // the production resolver here so this test reads from the
+        // exact path the extension just wrote to.
+        const { resolveSessionDbPath } = await import("../src/session/db.js");
+        const sessionsDir = join(
           process.env.HOME!,
           ".pi",
           "context-mode",
           "sessions",
-          "context-mode.db",
         );
+        const dbPath = resolveSessionDbPath({
+          projectDir: process.env.PI_PROJECT_DIR!,
+          sessionsDir,
+        });
         const db = new SessionDB({ dbPath });
         try {
           // SQLite datetime('now') stores UTC as "YYYY-MM-DD HH:MM:SS".
@@ -616,46 +897,49 @@ describe("Pi Extension", () => {
   });
 
   // ═══════════════════════════════════════════════════════════
-  // Slice 7: Routing block injection (Pi-1)
+  // Slice 7: Pi-1 lightweight routing anchor injection
   // ═══════════════════════════════════════════════════════════
 
   describe("Slice 7: Routing block injection", () => {
-    it("injects <context_window_protection> on first before_agent_start", async () => {
+    it("injects lightweight routing anchor via context hook on first before_agent_start", async () => {
       await registerPiExtension(api);
       await api._trigger("session_start", {}, {
         sessionManager: { getSessionFile: () => `routing-1-${Date.now()}-${Math.random()}` },
       });
 
-      const result = await api._trigger("before_agent_start", {
+      // before_agent_start sets _pendingContext (was previously modifying systemPrompt)
+      await api._trigger("before_agent_start", {
         systemPrompt: "Base prompt.",
       });
 
-      expect(result?.systemPrompt).toBeDefined();
-      expect(result.systemPrompt).toContain("<context_window_protection>");
+      // context hook now injects the routing anchor as a user message at message end
+      const messages: any[] = [];
+      const ctxResult = await api._trigger("context", { messages });
+
+      expect(ctxResult?.messages).toBeDefined();
+      expect(ctxResult.messages.length).toBe(1);
+      expect(ctxResult.messages[0].role).toBe("user");
+      expect(ctxResult.messages[0].content).toContain("context-mode active");
+      expect(ctxResult.messages[0].content).toContain("ctx_batch_execute > ctx_execute > ctx_execute_file");
     });
 
-    it("re-injects the routing block on every subsequent call (Pi rebuilds system prompt each turn)", async () => {
+    it("re-injects the anchor via context hook on every subsequent call", async () => {
       await registerPiExtension(api);
       await api._trigger("session_start", {}, {
         sessionManager: { getSessionFile: () => `routing-2-${Date.now()}-${Math.random()}` },
       });
 
-      const first = await api._trigger("before_agent_start", {
-        systemPrompt: "Base.",
-      });
-      const second = await api._trigger("before_agent_start", {
-        systemPrompt: "Base.",
-      });
-      const third = await api._trigger("before_agent_start", {
-        systemPrompt: "Base.",
-      });
-
       // Unlike Claude Code where the SessionStart hook persists context for the whole
-      // session, Pi rebuilds the system prompt fresh every turn. The routing block
-      // must be present on every call or the LLM loses MCP tool awareness after turn 1.
-      expect(first?.systemPrompt).toContain("<context_window_protection>");
-      expect(second?.systemPrompt).toContain("<context_window_protection>");
-      expect(third?.systemPrompt).toContain("<context_window_protection>");
+      // session, Pi rebuilds context fresh every turn. The anchor must reach the LLM
+      // on every call or the LLM loses MCP tool awareness after turn 1.
+      const ANCHOR = "context-mode active";
+
+      for (let call = 0; call < 3; call++) {
+        await api._trigger("before_agent_start", { systemPrompt: "Base." });
+        const ctxResult = await api._trigger("context", { messages: [] });
+        expect(ctxResult?.messages).toBeDefined();
+        expect(ctxResult.messages[0]?.content).toContain(ANCHOR);
+      }
     });
   });
 
@@ -700,36 +984,38 @@ describe("Pi Extension", () => {
   // ═══════════════════════════════════════════════════════════
 
   describe("Slice 9: active_memory injection", () => {
-    it("injects <active_memory> even when compact_count is 0", async () => {
+    it("injects context every turn via context hook even when compact_count is 0", async () => {
       await registerPiExtension(api);
       await api._trigger("session_start", {
         sessionManager: { getSessionFile: () => `active-mem-1-${Date.now()}-${Math.random()}` },
       });
 
-      // Seed user prompt with role pattern (priority 3) so the extractor
-      // produces a priority>=3 event the active_memory builder can pick up.
+      // Seed user prompt with role pattern (priority 3).
       await api._trigger("before_agent_start", {
         prompt: "You are a senior staff engineer reviewing this codebase.",
         systemPrompt: "Base.",
       });
 
-      // Second call should now contain <active_memory> built from those events.
-      const result = await api._trigger("before_agent_start", {
+      // Second call rebuilds context (always-on, not just post-compaction).
+      await api._trigger("before_agent_start", {
         systemPrompt: "Base 2.",
       });
 
-      expect(result?.systemPrompt).toBeDefined();
-      // Either the auto-injection helper (rules/decisions) OR the inline
-      // fallback (active_memory) should have produced injected content.
-      const sp = String(result.systemPrompt);
-      const hasActiveMemory =
-        sp.includes("<active_memory>") ||
-        sp.includes("<rules>") ||
-        sp.includes("<behavioral_directive>");
-      expect(hasActiveMemory).toBe(true);
+      // context hook injects the pending context as a user message
+      const ctxResult = await api._trigger("context", { messages: [] });
+
+      expect(ctxResult?.messages).toBeDefined();
+      expect(ctxResult.messages.length).toBe(1);
+      expect(ctxResult.messages[0].role).toBe("user");
+      // The always-on injection path fires every turn — the routing anchor
+      // proves context reaches the model even with compact_count 0.
+      const content = String(ctxResult.messages[0].content);
+      expect(content).toContain("context-mode active");
+      // Issue #856 — the role MUST NOT be pinned as a standing directive.
+      expect(content).not.toContain("<behavioral_directive>");
     });
 
-    it("caps active_memory at ≤ 2000 characters", async () => {
+    it("caps active_memory at ≤ 2000 characters (via context hook)", async () => {
       await registerPiExtension(api);
       await api._trigger("session_start", {
         sessionManager: { getSessionFile: () => `active-mem-2-${Date.now()}-${Math.random()}` },
@@ -744,24 +1030,73 @@ describe("Pi Extension", () => {
         });
       }
 
-      const result = await api._trigger("before_agent_start", {
+      await api._trigger("before_agent_start", {
         systemPrompt: "Base final.",
       });
 
-      const sp = String(result?.systemPrompt ?? "");
-      // Slice out the injected memory block (auto-injection or fallback).
-      const memMatch =
-        sp.match(/<active_memory>[\s\S]*?<\/active_memory>/) ??
-        sp.match(/<behavioral_directive>[\s\S]*?<\/behavioral_directive>/) ??
-        sp.match(/<rules>[\s\S]*?<\/rules>/);
-      if (memMatch) {
-        // 500 token cap × 4 chars/token = 2000 chars; allow small padding for
-        // XML wrappers from buildAutoInjection / fallback markers.
-        expect(memMatch[0].length).toBeLessThanOrEqual(2200);
-      } else {
-        // If no block exists, the test should surface the failure.
-        expect(memMatch).not.toBeNull();
-      }
+      const ctxResult = await api._trigger("context", { messages: [] });
+      const content = String(ctxResult?.messages?.[0]?.content ?? "");
+      // Issue #856 — flooding with role prompts must NOT accumulate any
+      // behavioral_directive, and the per-turn injection must stay bounded
+      // (it is now just the routing anchor; roles are filtered out entirely).
+      expect(content).not.toContain("<behavioral_directive>");
+      // Bounded: the anchor block is small and fixed — 20 × 500-char role
+      // prompts cannot blow the per-turn injection past the cap.
+      expect(content.length).toBeLessThanOrEqual(2200);
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════
+  // Slice 9b (#856): role is NOT re-injected as a standing
+  // behavioral_directive every turn (do-nothing-loop fix)
+  // ═══════════════════════════════════════════════════════════
+
+  describe("Slice 9b (#856): role not re-injected as behavioral_directive", () => {
+    it("never emits <behavioral_directive> in the per-turn context injection, even with a stored role", async () => {
+      await registerPiExtension(api);
+      const sessionFile = `role-noreinject-${Date.now()}-${Math.random()}`;
+      await api._trigger("session_start", {
+        sessionManager: { getSessionFile: () => sessionFile },
+      });
+
+      // Drive a genuine persona role prompt — extracted into the DB as a
+      // priority-3 `role` event. Pre-fix this froze as <behavioral_directive>
+      // and was replayed every turn.
+      await api._trigger("before_agent_start", {
+        prompt: "You are a senior staff engineer reviewing this codebase.",
+        systemPrompt: "Base.",
+      });
+
+      // Subsequent turn rebuilds context.
+      await api._trigger("before_agent_start", { systemPrompt: "Base 2." });
+      const ctxResult = await api._trigger("context", { messages: [] });
+      const content = String(ctxResult?.messages?.[0]?.content ?? "");
+
+      // The stale role must NOT be pinned as a standing behavioral_directive.
+      expect(content).not.toContain("<behavioral_directive>");
+    });
+
+    it("is surgical: drops the role directive but keeps the rest of the injection (routing anchor)", async () => {
+      await registerPiExtension(api);
+      const sessionFile = `role-filter-surgical-${Date.now()}-${Math.random()}`;
+      await api._trigger("session_start", {
+        sessionManager: { getSessionFile: () => sessionFile },
+      });
+
+      await api._trigger("before_agent_start", {
+        prompt: "You are a senior staff engineer reviewing this codebase.",
+        systemPrompt: "Base.",
+      });
+      await api._trigger("before_agent_start", { systemPrompt: "Base 2." });
+      const ctxResult = await api._trigger("context", { messages: [] });
+      const content = String(ctxResult?.messages?.[0]?.content ?? "");
+
+      // Role filtered out…
+      expect(content).not.toContain("<behavioral_directive>");
+      // …but injection itself is NOT disabled — the always-on routing anchor
+      // still reaches the model every turn (filter is role-specific, not a
+      // blanket drop of the whole context injection).
+      expect(content).toContain("context-mode active");
     });
   });
 
@@ -1045,34 +1380,38 @@ describe("Pi MCP bridge (#426)", () => {
     }, 30_000);
   });
 
-  // ── Wiring: pi-extension.ts default export must call bootstrapMCPTools
+  // ── Wiring: before_agent_start must bootstrap MCP tools
   //
   // This is the regression that the rest of the suite does NOT catch: if
-  // a future refactor drops the `bootstrapMCPTools(pi, …)` call from
-  // src/adapters/pi/extension.ts but keeps the bridge module intact, every other
-  // bridge test stays green and the bug silently re-enters. We assert
-  // here that the extension's default export, after `_mcpBridgeReady`
-  // settles, has actually called `pi.registerTool` for at least the
-  // canonical ctx_* set.
+  // a future refactor drops the `bootstrapMCPTools(pi, …)` call from the
+  // Pi lifecycle wiring but keeps the bridge module intact, every other
+  // bridge test stays green and the bug silently re-enters. The bridge is
+  // intentionally lazy now (#809): extension discovery alone must not spawn a
+  // child, but `before_agent_start` must register at least the canonical ctx_*
+  // set before the model call.
 
   describe("pi-extension.ts wiring (#426 regression guard)", () => {
-    it("registerPiExtension awaits bridge bootstrap and registers ctx_* via pi.registerTool", async () => {
+    it("before_agent_start bootstraps and registers ctx_* via pi.registerTool", async () => {
       const wireApi = createMockPiApi();
       // PI_PROJECT_DIR / CLAUDE_PROJECT_DIR set inside registerPiExtension.
       await registerPiExtension(wireApi, { projectDir: tempDir });
 
-      // Bootstrap is fire-and-forget on extension load — wait on the
-      // exported promise so the test does not race the spawn.
+      // Lazy bootstrap: no tool should be registered during extension discovery.
+      expect((wireApi.registerTool as any).mock.calls.length).toBe(0);
+
       const mod = await import("../src/adapters/pi/extension.js");
+      await wireApi._trigger("before_agent_start", {
+        prompt: "tool registration smoke",
+        systemPrompt: "",
+      });
       await mod._mcpBridgeReady;
 
       const calls = (wireApi.registerTool as any).mock.calls as Array<[any]>;
       const registeredNames = calls.map(([t]) => t?.name).filter(Boolean);
 
       // Same canonical pin as the bridge integration test — but reached
-      // through registerPiExtension instead of bootstrapMCPTools, so
-      // dropping the wiring fails this test even when the bridge module
-      // still works.
+      // through the Pi lifecycle hook instead of bootstrapMCPTools directly,
+      // so dropping the wiring fails even when the bridge module still works.
       expect(registeredNames).toEqual(
         expect.arrayContaining([
           "ctx_execute",
@@ -1083,7 +1422,7 @@ describe("Pi MCP bridge (#426)", () => {
         ]),
       );
 
-      // Cleanup: SIGTERM the bridge child the wiring spawned so it does
+      // Cleanup: SIGTERM the bridge child the hook spawned so it does
       // not leak past this test.
       const sd = mod.default as any;
       void sd; // silence unused
@@ -1094,13 +1433,13 @@ describe("Pi MCP bridge (#426)", () => {
     //
     // Each Pi subagent spawns a fresh `pi --mode json -p --no-session`
     // process that loads context-mode and then immediately fires
-    // `before_agent_start` to dispatch the LLM call. The MCP bridge
+    // `before_agent_start` to dispatch the LLM call. The lazy MCP bridge
     // bootstrap (spawn server.bundle.mjs → initialize → tools/list →
-    // pi.registerTool × N) is fire-and-forget via `_mcpBridgeReady`, so
-    // without an explicit await the LLM call goes out with an empty
-    // ctx_* tool registry and the routing block (~2.5K tokens) becomes
-    // dead weight — the LLM is told to call ctx_execute / ctx_search /
-    // etc. but Pi has not yet registered them.
+    // pi.registerTool × N) starts in that hook, so without an explicit await
+    // the LLM call would go out with an empty ctx_* tool registry and the
+    // routing block (~2.5K tokens) would become dead weight — the LLM is told
+    // to call ctx_execute / ctx_search / etc. but Pi has not yet registered
+    // them.
     //
     // This test pins the contract: by the time `before_agent_start`
     // resolves, the canonical ctx_* tools MUST have been registered
@@ -1119,9 +1458,8 @@ describe("Pi MCP bridge (#426)", () => {
         { session_id: "race-test", project_dir: tempDir },
       );
 
-      // Sanity: bridge bootstrap is in flight, no tool registered yet.
-      // If this ever fails, the bridge stopped racing and the test
-      // loses meaning — adjust the bootstrap or remove the guard.
+      // Sanity: lazy bootstrap has not started during extension/session setup.
+      // If this ever fails, the bridge became eager again and #809 can regress.
       const preCalls = (wireApi.registerTool as any).mock.calls.length;
       expect(preCalls).toBe(0);
 
@@ -1169,22 +1507,28 @@ describe("Pi MCP bridge (#426)", () => {
   // bounded at 5s, shutdown awaits bridge bootstrap up to 2s.
 
   describe("Pi bridge resilience (#472 round-3)", () => {
-    it("captures child stderr instead of swallowing it (case 1: crash diagnostics)", async () => {
+    it("routes child stderr to pi.logger, NOT the TUI terminal (case 1: crash diagnostics; #472 intent / #868)", async () => {
       // Server writes a diagnostic line to stderr then exits non-zero,
       // mimicking a real crash during initialize. With stdio[2] = "ignore"
-      // the diagnostic vanishes; with "pipe" it must reach process.stderr.
+      // the diagnostic vanishes (#472). We keep capturing it — but route it
+      // through `diag` (Pi's file logger), NEVER process.stderr, because Pi's
+      // raw-mode TUI renders any console write into the editor box (#868).
       const fakePath = writeFakeServer(`
         process.stderr.write("FAKE_MCP_CRASH_DIAG: bundle corrupted at line 42\\n");
         process.exit(1);
       `);
       const { MCPStdioClient } = await import("../src/adapters/pi/mcp-bridge.js");
-      const client = new MCPStdioClient(fakePath);
+      const logged: string[] = [];
+      const client = new MCPStdioClient(fakePath, process.env, null, (line) =>
+        logged.push(line),
+      );
 
-      const captured: string[] = [];
+      // Guard: nothing the child writes may reach process.stderr (Pi's TUI).
+      const stderrCaptured: string[] = [];
       const origWrite = process.stderr.write.bind(process.stderr);
       // @ts-expect-error monkeypatch
       process.stderr.write = (chunk: any, ...rest: any[]) => {
-        captured.push(typeof chunk === "string" ? chunk : chunk.toString("utf-8"));
+        stderrCaptured.push(typeof chunk === "string" ? chunk : chunk.toString("utf-8"));
         return origWrite(chunk, ...rest);
       };
 
@@ -1198,10 +1542,13 @@ describe("Pi MCP bridge (#426)", () => {
         client.shutdown();
       }
 
-      const all = captured.join("");
-      expect(all).toMatch(/FAKE_MCP_CRASH_DIAG/);
-      // Prefix lets ops grep across the noise of a real session.
-      expect(all).toMatch(/\[mcp-bridge\]/);
+      const all = logged.join("\n");
+      // #472 intent preserved: the crash diagnostic is captured (now in the log)…
+      expect(all.includes("FAKE_MCP_CRASH_DIAG")).toBe(true);
+      // …with the [mcp-bridge] prefix so ops can grep ~/.omp/logs.
+      expect(all.includes("[mcp-bridge]")).toBe(true);
+      // #868: it must NOT have been written to the terminal.
+      expect(stderrCaptured.join("").includes("FAKE_MCP_CRASH_DIAG")).toBe(false);
     }, 10_000);
 
     it.skipIf(process.platform === "win32")("escalates to SIGKILL when SIGTERM is ignored (case 2: bounded shutdown)", async () => {
@@ -1298,11 +1645,21 @@ describe("Pi MCP bridge (#426)", () => {
       const bridgeMod = await import("../src/adapters/pi/mcp-bridge.js");
       const handles: any[] = [];
       const origBootstrap = bridgeMod.bootstrapMCPTools;
+      let markBootstrapEntered!: () => void;
+      const bootstrapEntered = new Promise<void>((resolve) => {
+        markBootstrapEntered = resolve;
+      });
+      let releaseBootstrap!: () => void;
+      const bootstrapRelease = new Promise<void>((resolve) => {
+        releaseBootstrap = resolve;
+      });
       const spy = vi
         .spyOn(bridgeMod, "bootstrapMCPTools")
         .mockImplementation(async (...args: any[]) => {
+          markBootstrapEntered();
           const handle = await (origBootstrap as any)(...args);
           handles.push(handle);
+          await bootstrapRelease;
           return handle;
         });
 
@@ -1311,8 +1668,18 @@ describe("Pi MCP bridge (#426)", () => {
 
         const mod = await import("../src/adapters/pi/extension.js");
 
-        // Fire shutdown immediately — bootstrap is still in flight.
-        await wireApi._trigger("session_shutdown");
+        // Lazy bootstrap now starts from before_agent_start. Fire shutdown while
+        // that bootstrap promise is still pending, then release it so shutdown's
+        // bounded await can see and terminate the real handle.
+        const agentStart = wireApi._trigger("before_agent_start", {
+          prompt: "race",
+          systemPrompt: "",
+        });
+        await bootstrapEntered;
+        const shutdown = wireApi._trigger("session_shutdown");
+        releaseBootstrap();
+        await shutdown;
+        await agentStart;
 
         // Wait for the in-flight bootstrap to settle. By this point the
         // child has been spawned. If session_shutdown did NOT await
@@ -1347,6 +1714,53 @@ describe("Pi MCP bridge (#426)", () => {
         }
       }
     }, 30_000);
+
+    it("shuts down a bridge handle that resolves after the shutdown timeout", async () => {
+      const wireApi = createMockPiApi();
+      const bridgeMod = await import("../src/adapters/pi/mcp-bridge.js");
+
+      const staleShutdown = vi.fn();
+      const staleHandle = {
+        tools: [],
+        shutdown: staleShutdown,
+        client: { _spawnEnv: null } as unknown as InstanceType<
+          typeof bridgeMod.MCPStdioClient
+        >,
+      };
+
+      let resolveBootstrap!: (handle: typeof staleHandle) => void;
+      const bootstrapPromise = new Promise<typeof staleHandle>((resolve) => {
+        resolveBootstrap = resolve;
+      });
+      const spy = vi
+        .spyOn(bridgeMod, "bootstrapMCPTools")
+        .mockImplementation(async () => bootstrapPromise as any);
+
+      try {
+        await registerPiExtension(wireApi, { projectDir: tempDir });
+
+        const agentStart = wireApi._trigger("before_agent_start", {
+          prompt: "late-bootstrap-race",
+          systemPrompt: "",
+        });
+        await Promise.resolve();
+        expect(spy).toHaveBeenCalledTimes(1);
+
+        // Let session_shutdown hit its 2s ceiling while bootstrap is still
+        // pending. The late bootstrap resolution below must not publish a stale
+        // handle; it must self-shutdown the handle instead.
+        await wireApi._trigger("session_shutdown");
+        expect(staleShutdown).not.toHaveBeenCalled();
+
+        resolveBootstrap(staleHandle);
+        await agentStart;
+        await Promise.resolve();
+
+        expect(staleShutdown).toHaveBeenCalledTimes(1);
+      } finally {
+        spy.mockRestore();
+      }
+    }, 10_000);
   });
 });
 
@@ -1402,8 +1816,14 @@ describe("Pi extension respects PiAdapter session dir (#473 round-3)", () => {
 
     // DB file must be created under the mocked dir — proof that the
     // extension routes through PiAdapter rather than the hardcoded
-    // ~/.pi/context-mode/sessions literal.
-    const expectedDbPath = join(mockedSessionDir, "context-mode.db");
+    // ~/.pi/context-mode/sessions literal. Issue #645: the filename
+    // inside that dir is the canonical per-project `<hash>.db`, the
+    // same one the MCP server reads via `resolveSessionDbPath`.
+    const { resolveSessionDbPath } = await import("../src/session/db.js");
+    const expectedDbPath = resolveSessionDbPath({
+      projectDir,
+      sessionsDir: mockedSessionDir,
+    });
     const { existsSync: fileExists } = await import("node:fs");
     expect(fileExists(expectedDbPath)).toBe(true);
 
@@ -1419,5 +1839,93 @@ describe("Pi extension respects PiAdapter session dir (#473 round-3)", () => {
 
     delete process.env.PI_PROJECT_DIR;
     delete process.env.CLAUDE_PROJECT_DIR;
+  });
+});
+
+// ═══════════════════════════════════════════════════════════
+// Issue #645 — Pi extension opens SessionDB at the canonical
+// per-project hash path (`<hash>.db`), the same file the MCP
+// server reads via `resolveSessionDbPath`. The shared
+// `context-mode.db` literal is divergent — `ctx_stats` and
+// `ctx_search(sort: "timeline")` silently degrade because the
+// MCP server resolves a `<hash>.db` that does not exist.
+// Regression test pins the contract: Pi must use the canonical
+// helper, NOT the hardcoded literal.
+// ═══════════════════════════════════════════════════════════
+
+describe("Pi extension SessionDB path matches MCP server's canonical resolver (#645)", () => {
+  let scratch: string;
+  let mockedSessionDir: string;
+
+  beforeEach(() => {
+    scratch = mkdtempSync(join(tmpdir(), "pi-ext-645-"));
+    mockedSessionDir = join(scratch, "pi-sess");
+    mkdirSync(mockedSessionDir, { recursive: true });
+    vi.resetModules();
+  });
+
+  afterEach(() => {
+    try {
+      rmSync(scratch, { recursive: true, force: true });
+    } catch {
+      /* best effort */
+    }
+    vi.doUnmock("../src/adapters/pi/index.js");
+    vi.resetModules();
+    delete process.env.PI_PROJECT_DIR;
+    delete process.env.CLAUDE_PROJECT_DIR;
+  });
+
+  it("writes SessionDB to resolveSessionDbPath({projectDir, sessionsDir}), not the shared 'context-mode.db' literal", async () => {
+    vi.doMock("../src/adapters/pi/index.js", () => {
+      class MockPiAdapter {
+        getSessionDir() {
+          return mockedSessionDir;
+        }
+      }
+      return { PiAdapter: MockPiAdapter };
+    });
+
+    const projectDir = join(scratch, "project");
+    mkdirSync(projectDir, { recursive: true });
+    process.env.PI_PROJECT_DIR = projectDir;
+    process.env.CLAUDE_PROJECT_DIR = projectDir;
+
+    const localApi = createMockPiApi();
+    const mod = await import("../src/adapters/pi/extension.js");
+    await mod.default(localApi);
+
+    await localApi._trigger("session_start", {}, {});
+
+    // The MCP server (src/server.ts) resolves the SessionDB path via
+    // resolveSessionDbPath({ projectDir, sessionsDir }). The Pi
+    // extension MUST write to the same file. Compute the canonical
+    // path with the SAME helper the server uses and require it to
+    // exist on disk after session_start.
+    const { resolveSessionDbPath } = await import("../src/session/db.js");
+    const canonicalPath = resolveSessionDbPath({
+      projectDir,
+      sessionsDir: mockedSessionDir,
+    });
+    const { existsSync: fileExists } = await import("node:fs");
+    expect(fileExists(canonicalPath)).toBe(true);
+
+    // The shared literal must NOT be created — that was the bug.
+    const buggyLiteralPath = join(mockedSessionDir, "context-mode.db");
+    // Only fail the "no literal" check when canonical ≠ literal.
+    // (They differ for any real projectDir → 16-hex hash.)
+    if (canonicalPath !== buggyLiteralPath) {
+      expect(fileExists(buggyLiteralPath)).toBe(false);
+    }
+
+    // ctx-doctor must surface the same canonical path so users
+    // diagnosing degraded ctx_stats see the actual on-disk file.
+    const doctor = localApi._getCommand("ctx-doctor");
+    expect(doctor?.handler).toBeDefined();
+    const result = await doctor!.handler!({}, { hasUI: false });
+    const text = String((result as { text?: string } | undefined)?.text ?? "");
+    expect(text).toContain(canonicalPath);
+
+    await localApi._trigger("session_shutdown");
   });
 });

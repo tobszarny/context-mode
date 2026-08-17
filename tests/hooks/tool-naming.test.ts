@@ -22,10 +22,12 @@ let createRoutingBlock: (t: (tool: string) => string) => string;
 let createReadGuidance: (t: (tool: string) => string) => string;
 let createGrepGuidance: (t: (tool: string) => string) => string;
 let createBashGuidance: (t: (tool: string) => string) => string;
+let createExternalMcpGuidance: (t: (tool: string) => string) => string;
 let ROUTING_BLOCK: string;
 let READ_GUIDANCE: string;
 let GREP_GUIDANCE: string;
 let BASH_GUIDANCE: string;
+let EXTERNAL_MCP_GUIDANCE: string;
 
 beforeAll(async () => {
   const naming = await import("../../hooks/core/tool-naming.mjs");
@@ -42,10 +44,12 @@ beforeAll(async () => {
   createReadGuidance = block.createReadGuidance;
   createGrepGuidance = block.createGrepGuidance;
   createBashGuidance = block.createBashGuidance;
+  createExternalMcpGuidance = block.createExternalMcpGuidance;
   ROUTING_BLOCK = block.ROUTING_BLOCK;
   READ_GUIDANCE = block.READ_GUIDANCE;
   GREP_GUIDANCE = block.GREP_GUIDANCE;
   BASH_GUIDANCE = block.BASH_GUIDANCE;
+  EXTERNAL_MCP_GUIDANCE = block.EXTERNAL_MCP_GUIDANCE;
 });
 
 // MCP readiness sentinel — routing.mjs checks process.ppid in-process
@@ -81,6 +85,12 @@ describe("getToolName", () => {
   it("returns correct name for antigravity", () => {
     expect(getToolName("antigravity", "ctx_execute")).toBe(
       "mcp__context-mode__ctx_execute",
+    );
+  });
+
+  it("returns correct name for antigravity-cli", () => {
+    expect(getToolName("antigravity-cli", "ctx_execute_file")).toBe(
+      "context-mode/ctx_execute_file",
     );
   });
 
@@ -211,6 +221,43 @@ describe("createBashGuidance", () => {
   });
 });
 
+describe("createExternalMcpGuidance (#529)", () => {
+  it("uses kiro-style tool names for kiro platform", () => {
+    const t = createToolNamer("kiro");
+    const guidance = createExternalMcpGuidance(t);
+    expect(guidance).toContain("@context-mode/ctx_execute");
+    expect(guidance).toContain("@context-mode/ctx_fetch_and_index");
+    expect(guidance).toContain("@context-mode/ctx_search");
+  });
+
+  it("uses opencode-style tool names for opencode platform", () => {
+    const t = createToolNamer("opencode");
+    const guidance = createExternalMcpGuidance(t);
+    expect(guidance).toContain("context-mode_ctx_execute");
+    expect(guidance).toContain("context-mode_ctx_fetch_and_index");
+    expect(guidance).toContain("context-mode_ctx_search");
+  });
+
+  it("uses zed-style tool names for zed platform", () => {
+    const t = createToolNamer("zed");
+    const guidance = createExternalMcpGuidance(t);
+    expect(guidance).toContain("mcp:context-mode:ctx_execute");
+    expect(guidance).toContain("mcp:context-mode:ctx_fetch_and_index");
+    expect(guidance).toContain("mcp:context-mode:ctx_search");
+  });
+
+  it("mentions the routing intent so the model knows what to do", () => {
+    const t = createToolNamer("claude-code");
+    const guidance = createExternalMcpGuidance(t);
+    // Identifies the situation
+    expect(guidance).toContain("External MCP tools");
+    // Points to the right tools — losing any of these defeats the guidance
+    expect(guidance).toMatch(/ctx_execute/);
+    expect(guidance).toMatch(/ctx_fetch_and_index/);
+    expect(guidance).toMatch(/ctx_search/);
+  });
+});
+
 // ═══════════════════════════════════════════════════════════════════
 // Backward Compat — Static Exports
 // ═══════════════════════════════════════════════════════════════════
@@ -241,6 +288,22 @@ describe("backward compat static exports", () => {
     expect(BASH_GUIDANCE).toContain(
       "mcp__plugin_context-mode_context-mode__ctx_batch_execute",
     );
+  });
+
+  it("EXTERNAL_MCP_GUIDANCE uses claude-code naming and matches the factory (#529)", () => {
+    expect(EXTERNAL_MCP_GUIDANCE).toContain(
+      "mcp__plugin_context-mode_context-mode__ctx_execute",
+    );
+    expect(EXTERNAL_MCP_GUIDANCE).toContain(
+      "mcp__plugin_context-mode_context-mode__ctx_fetch_and_index",
+    );
+    expect(EXTERNAL_MCP_GUIDANCE).toContain(
+      "mcp__plugin_context-mode_context-mode__ctx_search",
+    );
+    // Drift guard: the static export must equal the factory output with the
+    // default (claude-code) namer — they share a single template.
+    const claudeCodeT = createToolNamer("claude-code");
+    expect(EXTERNAL_MCP_GUIDANCE).toBe(createExternalMcpGuidance(claudeCodeT));
   });
 });
 
@@ -273,7 +336,11 @@ describe("routePreToolUse with platform parameter", () => {
     expect(result).not.toBeNull();
     const cmd = (result!.updatedInput as Record<string, string>).command;
     expect(cmd).toContain("ctx_execute");
-    expect(cmd).toContain("Think in Code");
+    // PR #683 follow-up (ADR-0003 amendment): "Think in Code" voice-of-trainer
+    // marker was folded into the imperative call instruction. The deny reason
+    // now opens with the affirmative redirect frame; assert on the explicit
+    // ctx_execute call instruction that survived the rewrite.
+    expect(cmd).toContain("Call ctx_execute");
     expect(cmd).not.toContain("mcp__");
   });
 
@@ -336,6 +403,20 @@ describe("routePreToolUse with platform parameter", () => {
     expect(search!.additionalContext).toContain("ctx_execute");
   });
 
+  it("Read guidance uses agy context-mode/<tool> names when platform=antigravity-cli", () => {
+    resetGuidanceThrottle();
+    const result = routePreToolUse(
+      "view_file",
+      { AbsolutePath: "/tmp/a.ts" },
+      "/tmp",
+      "antigravity-cli",
+    );
+    expect(result).not.toBeNull();
+    expect(result!.action).toBe("context");
+    expect(result!.additionalContext).toContain("context-mode/ctx_execute_file");
+    expect(result!.additionalContext).not.toContain("mcp__context-mode__ctx_execute_file");
+  });
+
   it("build tool redirect uses platform tool names when platform=gemini-cli", () => {
     const result = routePreToolUse("Bash", { command: "./gradlew build" }, "/tmp", "gemini-cli");
     expect(result).not.toBeNull();
@@ -357,7 +438,7 @@ describe("routePreToolUse with platform parameter", () => {
       expect(result).not.toBeNull();
       expect(result!.action).toBe("modify");
       expect((result!.updatedInput as Record<string, string>).command).toContain(
-        "curl/wget blocked",
+        "curl/wget redirected",
       );
     });
 
@@ -370,7 +451,7 @@ describe("routePreToolUse with platform parameter", () => {
       );
       expect(result).not.toBeNull();
       expect(result!.action).toBe("deny");
-      expect(result!.reason).toContain("WebFetch blocked");
+      expect(result!.reason).toContain("WebFetch redirected");
     });
 
     it("read_file routes as Read → context guidance", () => {

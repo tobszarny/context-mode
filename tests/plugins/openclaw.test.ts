@@ -50,6 +50,49 @@ interface MockContextEngine {
   };
 }
 
+function createMockApiWithoutRegisterHook() {
+  const lifecycle: MockLifecycleEntry[] = [];
+  const tools: MockToolEntry[] = [];
+  const commands: MockCommandEntry[] = [];
+  const warnings: unknown[][] = [];
+
+  return {
+    lifecycle,
+    tools,
+    commands,
+    warnings,
+    api: {
+      on(
+        event: string,
+        handler: (...args: unknown[]) => unknown,
+        opts?: { priority?: number },
+      ) {
+        lifecycle.push({ event, handler, opts });
+      },
+      registerCommand(command: unknown) {
+        if (
+          !command ||
+          typeof command !== "object" ||
+          typeof (command as { name?: unknown }).name !== "string" ||
+          typeof (command as { handler?: unknown }).handler !== "function"
+        ) {
+          throw new TypeError("registerCommand(command) expected");
+        }
+        commands.push(command as MockCommandEntry);
+      },
+      registerTool(
+        tool: Omit<MockToolEntry, "optional">,
+        opts?: { optional?: boolean },
+      ) {
+        tools.push({ ...tool, optional: opts?.optional });
+      },
+      logger: {
+        warn: (...args: unknown[]) => warnings.push(args),
+      },
+    },
+  };
+}
+
 interface MockCommandEntry {
   name: string;
   description: string;
@@ -265,6 +308,22 @@ describe("OpenClawPlugin", () => {
         expect(hook.meta.description.length).toBeGreaterThan(0);
       }
     });
+
+    it("degrades gracefully when registerHook and registerContextEngine are unavailable", async () => {
+      const { default: plugin } = await import("../../src/adapters/openclaw/plugin.js");
+      const mock = createMockApiWithoutRegisterHook();
+
+      expect(() => plugin.register(mock.api as unknown as Parameters<typeof plugin.register>[0]))
+        .not.toThrow();
+      expect(mock.tools.length).toBeGreaterThan(0);
+      expect(mock.commands.map((c) => c.name)).toEqual(
+        expect.arrayContaining(["ctx-stats", "ctx-doctor", "ctx-upgrade"]),
+      );
+      const lifecycleNames = mock.lifecycle.map((h) => h.event);
+      expect(lifecycleNames).toContain("before_tool_call");
+      expect(lifecycleNames).toContain("command:new");
+      expect(mock.warnings.length).toBeGreaterThan(0);
+    });
   });
 
   // ── Auto-reply commands ───────────────────────────────
@@ -418,6 +477,56 @@ describe("OpenClawPlugin", () => {
     });
   });
 
+  // ── model.usage diagnostic subscription (cost capture wire) ──
+
+  describe("model.usage diagnostic subscription", () => {
+    it("subscribes via api.onDiagnosticEvent and flows a model.usage event to db.insertEvent", async () => {
+      // Capture the listener the plugin registers on the diagnostic bus.
+      let diagListener: ((evt: unknown) => void) | undefined;
+      const mock = createMockApiFull();
+      const api = {
+        ...mock.api,
+        onDiagnosticEvent(listener: (evt: unknown) => void) {
+          diagListener = listener;
+          return () => {};
+        },
+      };
+
+      const insertSpy = vi.spyOn(OpenClawSessionDB.prototype, "insertEvent");
+      insertSpy.mockClear();
+
+      const { default: plugin } = await import("../../src/adapters/openclaw/plugin.js");
+      await plugin.register(api as unknown as Parameters<typeof plugin.register>[0]);
+
+      expect(typeof diagListener).toBe("function");
+
+      // Fire a real model.usage diagnostic payload.
+      diagListener!({
+        type: "model.usage",
+        model: "claude-sonnet-4",
+        usage: { input: 1200, output: 340, cacheRead: 5000, cacheWrite: 800 },
+        costUsd: 0.0421,
+      });
+
+      const usageInsert = insertSpy.mock.calls.find(
+        (c) => (c[1] as { type?: string })?.type === "agent_usage",
+      );
+      expect(usageInsert).toBeDefined();
+      expect((usageInsert![1] as { cost_usd?: number }).cost_usd).toBe(0.0421);
+      expect(usageInsert![2]).toBe("Diagnostic"); // PostToolUse-style source tag
+
+      // Non-usage payloads insert no agent_usage event (best-effort, no throw).
+      const before = insertSpy.mock.calls.length;
+      expect(() => diagListener!({ type: "model.failover" })).not.toThrow();
+      const afterUsage = insertSpy.mock.calls
+        .slice(before)
+        .filter((c) => (c[1] as { type?: string })?.type === "agent_usage");
+      expect(afterUsage).toHaveLength(0);
+
+      insertSpy.mockRestore();
+    });
+  });
+
   // ── command:new ───────────────────────────────────────
 
   describe("command:new", () => {
@@ -456,6 +565,17 @@ describe("OpenClawPlugin", () => {
       const result = promptHook!.handler() as { appendSystemContext: string };
       expect(result).toHaveProperty("appendSystemContext");
       expect(result.appendSystemContext).toContain("context-mode");
+    });
+
+    it("injects skill-like guidance derived from skills/context-mode/SKILL.md", async () => {
+      const mock = await createTestPlugin(join(tempDir, "prompt-skill-like"));
+      await flushInit(mock);
+      const promptHook = mock.lifecycle.find(
+        (l) => l.event === "before_prompt_build" && l.opts?.priority === 5,
+      );
+      const result = promptHook!.handler() as { appendSystemContext?: string };
+      expect(result?.appendSystemContext).toContain("<context_mode_skill_like_guidance");
+      expect(result?.appendSystemContext).toContain("Default to context-mode for ALL commands.");
     });
 
     it("has priority 5", async () => {
@@ -604,6 +724,7 @@ describe("OpenClawPlugin", () => {
       expect(out?.inputOverride?.prompt).toBeDefined();
       expect(out!.inputOverride!.prompt!).toContain("Investigate the failing test.");
       expect(out!.inputOverride!.prompt!).toContain("<context_window_protection>");
+      expect(out!.inputOverride!.prompt!).toContain("<context_mode_skill_like_guidance");
     });
 
     it("falls back gracefully when input.prompt is missing", async () => {
@@ -614,6 +735,7 @@ describe("OpenClawPlugin", () => {
         | { inputOverride?: { prompt?: string } }
         | undefined;
       expect(out?.inputOverride?.prompt).toContain("<context_window_protection>");
+      expect(out?.inputOverride?.prompt).toContain("<context_mode_skill_like_guidance");
     });
   });
 
@@ -786,6 +908,104 @@ describe("OpenClawPlugin", () => {
       // Before hook replaces the command
       await beforeHook!.handler(event);
       expect(params.command).toContain("context-mode");
+    });
+  });
+
+  // ═══════════════════════════════════════════════════════════
+  // Issue #645 follow-up — OpenClaw plugin SessionDB path must
+  // match the MCP server's canonical resolver. The pre-fix code
+  // computed a raw `sha256(projectDir).slice(0, 16)` directly,
+  // which misses case-folding on darwin/win32 and the worktree
+  // suffix. `resolveSessionDbPath` handles both. Without this,
+  // any OpenClaw user whose projectDir contains an uppercase
+  // character (typical on macOS — `/Users/Foo/Projects/Bar`)
+  // sees `ctx_stats` and `ctx_search(sort: "timeline")` silently
+  // degrade because the MCP server reads the case-folded
+  // canonical hash while the plugin writes to the raw hash.
+  // ═══════════════════════════════════════════════════════════
+
+  describe("Issue #645 follow-up: SessionDB path matches MCP server's canonical resolver", () => {
+    it("writes SessionDB to resolveSessionDbPath({projectDir, sessionsDir}), not raw sha256(projectDir).slice(0,16)", async () => {
+      // Pick a mixed-case project dir so the canonical (case-folded)
+      // hash diverges from the raw hash on darwin/win32. On Linux
+      // the two coincide by design (case-sensitive FS) so the
+      // assertion still passes — it just stops catching the bug.
+      // On macOS `/var/...` is a symlink to `/private/var/...`, and
+      // `process.chdir()` followed by `process.cwd()` returns the
+      // realpath. The plugin reads `process.cwd()` for projectDir, so
+      // we must hash the realpath form too (otherwise the canonical
+      // hash we compute below diverges from the one the plugin used).
+      const { realpathSync } = await import("node:fs");
+      const mixedCaseProject = realpathSync(
+        mkdtempSync(join(tmpdir(), "OpenClaw-Mixed-")),
+      );
+      const prevCwd = process.cwd();
+      const priorOverride = process.env.CONTEXT_MODE_DATA_DIR;
+      // Route the OpenClaw sessions dir into a fresh scratch root so
+      // we never collide with the developer's real ~/.openclaw DB.
+      const dataRoot = mkdtempSync(join(tmpdir(), "openclaw-645-root-"));
+      process.env.CONTEXT_MODE_DATA_DIR = dataRoot;
+      try {
+        // OpenClaw plugin resolves projectDir via process.cwd() at
+        // register() time (src/adapters/openclaw/plugin.ts:250).
+        process.chdir(mixedCaseProject);
+        vi.resetModules();
+        const { default: plugin } = await import(
+          "../../src/adapters/openclaw/plugin.js"
+        );
+        const mock = createMockApiFull();
+        plugin.register(mock.api);
+
+        // Compute the canonical hash INLINE (do NOT call
+        // resolveSessionDbPath here — that helper performs a one-shot
+        // legacy→canonical rename when only the legacy file exists,
+        // which would silently migrate the pre-fix raw-hash DB into a
+        // canonical-hash file and make this test a tautology that
+        // always passes. We need to observe what's actually on disk
+        // before any migration runs.
+        const { hashProjectDirCanonical } = await import(
+          "../../src/session/db.js"
+        );
+        const sessionsDir = join(
+          dataRoot,
+          "context-mode",
+          "sessions",
+        );
+        const canonicalHash = hashProjectDirCanonical(mixedCaseProject);
+        const canonicalPath = join(sessionsDir, `${canonicalHash}.db`);
+
+        const { existsSync: fileExists } = await import("node:fs");
+        expect(fileExists(canonicalPath)).toBe(true);
+
+        // The pre-fix raw-sha256 literal must NOT be created. On
+        // darwin/win32 the raw hash diverges from the canonical
+        // (case-folded) hash for any mixedCaseProject. On Linux they
+        // coincide — the assertion becomes a self-check that still
+        // passes correctly via the canonical branch.
+        const { createHash } = await import("node:crypto");
+        const rawHash = createHash("sha256")
+          .update(mixedCaseProject)
+          .digest("hex")
+          .slice(0, 16);
+        const buggyRawPath = join(sessionsDir, `${rawHash}.db`);
+        if (canonicalPath !== buggyRawPath) {
+          expect(fileExists(buggyRawPath)).toBe(false);
+        }
+
+        // Mock api is registered solely to flush plugin init; we
+        // assert against the on-disk DB file the plugin opened.
+        void mock;
+      } finally {
+        try { process.chdir(prevCwd); } catch { /* best effort */ }
+        try { rmSync(mixedCaseProject, { recursive: true, force: true }); } catch { /* best effort */ }
+        try { rmSync(dataRoot, { recursive: true, force: true }); } catch { /* best effort */ }
+        if (priorOverride === undefined) {
+          delete process.env.CONTEXT_MODE_DATA_DIR;
+        } else {
+          process.env.CONTEXT_MODE_DATA_DIR = priorOverride;
+        }
+        vi.resetModules();
+      }
     });
   });
 });

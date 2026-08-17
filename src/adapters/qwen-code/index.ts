@@ -22,9 +22,10 @@ import { resolve, join } from "node:path";
 import { homedir } from "node:os";
 
 import { ClaudeCodeBaseAdapter, type ClaudeCodeWireInput } from "../claude-code-base.js";
+import { EXTERNAL_MCP_MATCHER_PATTERN } from "./hooks.js";
 
 import {
-  buildNodeCommand,
+  buildHookRuntimeCommand,
   type HookAdapter,
   type HookParadigm,
   type PlatformCapabilities,
@@ -77,6 +78,9 @@ export class QwenCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdapte
       "mcp__plugin_context-mode_context-mode__ctx_execute",
       "mcp__plugin_context-mode_context-mode__ctx_execute_file",
       "mcp__plugin_context-mode_context-mode__ctx_batch_execute",
+      // External MCP catch-all (#529). Negative-lookahead excludes context-mode's
+      // own server segments so the explicit entries above are not double-routed.
+      EXTERNAL_MCP_MATCHER_PATTERN,
     ].join("|");
 
     return {
@@ -84,7 +88,7 @@ export class QwenCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdapte
         {
           matcher: preToolUseMatcher,
           hooks: [
-            { type: "command", command: buildNodeCommand(`${pluginRoot}/hooks/pretooluse.mjs`) },
+            { type: "command", command: buildHookRuntimeCommand(`${pluginRoot}/hooks/pretooluse.mjs`) },
           ],
         },
       ],
@@ -92,7 +96,7 @@ export class QwenCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdapte
         {
           matcher: "run_shell_command|read_file|write_file|edit|glob|grep_search|todo_write|agent|ask_user_question|mcp__",
           hooks: [
-            { type: "command", command: buildNodeCommand(`${pluginRoot}/hooks/posttooluse.mjs`) },
+            { type: "command", command: buildHookRuntimeCommand(`${pluginRoot}/hooks/posttooluse.mjs`) },
           ],
         },
       ],
@@ -100,7 +104,7 @@ export class QwenCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdapte
         {
           matcher: "",
           hooks: [
-            { type: "command", command: buildNodeCommand(`${pluginRoot}/hooks/sessionstart.mjs`) },
+            { type: "command", command: buildHookRuntimeCommand(`${pluginRoot}/hooks/sessionstart.mjs`) },
           ],
         },
       ],
@@ -108,7 +112,7 @@ export class QwenCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdapte
         {
           matcher: "",
           hooks: [
-            { type: "command", command: buildNodeCommand(`${pluginRoot}/hooks/precompact.mjs`) },
+            { type: "command", command: buildHookRuntimeCommand(`${pluginRoot}/hooks/precompact.mjs`) },
           ],
         },
       ],
@@ -116,7 +120,20 @@ export class QwenCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdapte
         {
           matcher: "",
           hooks: [
-            { type: "command", command: buildNodeCommand(`${pluginRoot}/hooks/userpromptsubmit.mjs`) },
+            { type: "command", command: buildHookRuntimeCommand(`${pluginRoot}/hooks/userpromptsubmit.mjs`) },
+          ],
+        },
+      ],
+      // Stop fires at end-of-turn. The qwen-specific stop hook records a
+      // turn_end marker AND captures per-turn token cost by tailing the session
+      // chats JSONL (~/.qwen/tmp/<hash>/chats/<sessionId>.jsonl) — usage is not
+      // reachable through hook stdin (usage.ts matrix §4). Points at the
+      // qwen-code/ hook dir (not the shared root) so it sets the qwen platform.
+      Stop: [
+        {
+          matcher: "",
+          hooks: [
+            { type: "command", command: buildHookRuntimeCommand(`${pluginRoot}/hooks/qwen-code/stop.mjs`) },
           ],
         },
       ],
@@ -150,7 +167,7 @@ export class QwenCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdapte
     const settings = this.readSettings();
     const hooks = (settings?.hooks ?? {}) as Record<string, unknown>;
 
-    for (const hookName of ["PreToolUse", "PostToolUse", "SessionStart", "PreCompact", "UserPromptSubmit"]) {
+    for (const hookName of ["PreToolUse", "PostToolUse", "SessionStart", "PreCompact", "UserPromptSubmit", "Stop"]) {
       const configured = Array.isArray(hooks[hookName]) && (hooks[hookName] as unknown[]).length > 0;
       results.push({
         check: `${hookName} hook`,
@@ -290,6 +307,8 @@ export class QwenCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdapte
           "mcp__plugin_context-mode_context-mode__ctx_execute",
           "mcp__plugin_context-mode_context-mode__ctx_execute_file",
           "mcp__plugin_context-mode_context-mode__ctx_batch_execute",
+          // External MCP catch-all (#529) — keep in sync with generateHookConfig above.
+          EXTERNAL_MCP_MATCHER_PATTERN,
         ].join("|"),
       },
       {
@@ -312,12 +331,21 @@ export class QwenCodeAdapter extends ClaudeCodeBaseAdapter implements HookAdapte
         script: "userpromptsubmit.mjs",
         matcher: "",
       },
+      {
+        // Stop captures per-turn token cost by tailing the session chats JSONL
+        // (usage is unreachable through hook stdin). Routes to the qwen-code/
+        // hook dir so it sets the qwen platform — keep in sync with
+        // generateHookConfig above.
+        name: "Stop",
+        script: "qwen-code/stop.mjs",
+        matcher: "",
+      },
     ];
 
     for (const { name, script, matcher } of hookTypes) {
       const entry = {
         matcher,
-        hooks: [{ type: "command", command: buildNodeCommand(`${pluginRoot}/hooks/${script}`) }],
+        hooks: [{ type: "command", command: buildHookRuntimeCommand(`${pluginRoot}/hooks/${script}`) }],
       };
 
       const existing = hooks[name] as Array<Record<string, unknown>> | undefined;

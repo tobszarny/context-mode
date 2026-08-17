@@ -11,12 +11,13 @@
  */
 
 import {
-  ROUTING_BLOCK, READ_GUIDANCE, GREP_GUIDANCE, BASH_GUIDANCE,
+  ROUTING_BLOCK, READ_GUIDANCE, GREP_GUIDANCE, BASH_GUIDANCE, EXTERNAL_MCP_GUIDANCE,
   createRoutingBlock, createReadGuidance, createGrepGuidance, createBashGuidance,
+  createExternalMcpGuidance,
 } from "../routing-block.mjs";
 import { createToolNamer } from "./tool-naming.mjs";
 import { isMCPReady } from "./mcp-ready.mjs";
-import { existsSync, mkdirSync, rmSync, rmdirSync, readdirSync, unlinkSync, openSync, closeSync, statSync, constants as fsConstants } from "node:fs";
+import { existsSync, mkdirSync, rmSync, rmdirSync, readdirSync, unlinkSync, openSync, closeSync, readFileSync, writeFileSync, statSync, constants as fsConstants } from "node:fs";
 
 /**
  * Guard for actions that redirect to MCP tools (#230).
@@ -24,11 +25,12 @@ import { existsSync, mkdirSync, rmSync, rmdirSync, readdirSync, unlinkSync, open
  * redirect action — prevents agent from getting stuck when MCP tools
  * are unavailable. Applies to deny and modify actions that mention MCP alternatives.
  */
-function mcpRedirect(result) {
+function mcpRedirect(result, mcpToolsAvailable = true) {
+  if (!mcpToolsAvailable) return null;
   if (!isMCPReady()) return null;
   return result;
 }
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { resolve } from "node:path";
 
 // Guidance throttle: show each advisory type at most once per session.
@@ -47,6 +49,63 @@ import { resolve } from "node:path";
 // pass it to routePreToolUse so the marker directory stays consistent across
 // invocations of the same logical session.
 const _guidanceShown = new Set();
+
+// Periodic-guidance counters: how many times each (sessionId, type) pair has
+// fired the periodic branch. Keyed by `${sessionId-or-ppid}::${type}`.
+// File-backed for cross-process so hook invocations from the same logical
+// session keep the counter coherent.
+const _guidanceCounters = new Map();
+
+// External-MCP nudge cadence — fire every N matching tool calls.
+// Default 10: keeps the guidance fresh in long MCP-heavy sessions (e.g. a
+// Jira/Slack/Notion run with 50+ tool calls — see #567 follow-up) without
+// flooding context with repeat nudges. Bounds [1, 100]; invalid env values
+// fall back to default. period=1 means "fire every call" (opt-in only).
+const EXTERNAL_MCP_NUDGE_DEFAULT = 10;
+const EXTERNAL_MCP_NUDGE_MIN = 1;
+const EXTERNAL_MCP_NUDGE_MAX = 100;
+const EXTERNAL_MCP_NUDGE_ENV = "CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY";
+
+function getExternalMcpNudgeEvery() {
+  const raw = process.env[EXTERNAL_MCP_NUDGE_ENV];
+  if (raw == null || raw === "") return EXTERNAL_MCP_NUDGE_DEFAULT;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < EXTERNAL_MCP_NUDGE_MIN || parsed > EXTERNAL_MCP_NUDGE_MAX) {
+    return EXTERNAL_MCP_NUDGE_DEFAULT;
+  }
+  return parsed;
+}
+
+// #817: size threshold so small Bash calls skip the routing nudge.
+//
+// PreToolUse fires BEFORE the command runs, so the actual output size is
+// unknowable here. The only deterministic pre-execution signal is the command
+// string itself. The Gemini CLI adapter solves the same over-interception
+// problem with a matcher that only fires on large-output tools — "avoids
+// unnecessary hook overhead on lightweight tools" (README). We mirror that at
+// the routing layer: when CONTEXT_MODE_BASH_NUDGE_MIN_COMMAND_BYTES is set to
+// N>0, an unbounded Bash command whose UTF-8 byte length is below N is treated
+// as expected-lightweight and the generic routing nudge is suppressed.
+//
+// Default is 0 (unset) → CURRENT BEHAVIOR: every unbounded command is nudged.
+// This preserves the context-saving guarantee for large outputs by default —
+// the threshold is strictly opt-in. Bounds [0, 100000]; invalid/zero/negative
+// values fall back to 0 (disabled). The threshold gates ONLY the generic Bash
+// nudge — curl/wget, inline-HTTP, and build-tool redirects run earlier and are
+// never relaxed, because those are deterministic floods regardless of command
+// length.
+const BASH_NUDGE_MIN_BYTES_ENV = "CONTEXT_MODE_BASH_NUDGE_MIN_COMMAND_BYTES";
+const BASH_NUDGE_MIN_BYTES_MAX = 100_000;
+
+function getBashNudgeMinCommandBytes() {
+  const raw = process.env[BASH_NUDGE_MIN_BYTES_ENV];
+  if (raw == null || raw === "") return 0;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0 || parsed > BASH_NUDGE_MIN_BYTES_MAX) {
+    return 0;
+  }
+  return parsed;
+}
 
 function defaultGuidanceId() {
   return process.env.VITEST_WORKER_ID
@@ -85,6 +144,56 @@ function guidanceOnce(type, content, sessionId) {
 }
 
 /**
+ * Like guidanceOnce, but fires on a periodic cadence (calls 1, period+1,
+ * 2·period+1, …) rather than once per session.
+ *
+ * Motivation: external-MCP tool runs can span 50+ calls (e.g. a Jira/Slack
+ * search loop — see #567 follow-up). A single one-shot nudge gets lost
+ * after the model's context compaction kicks in, and subsequent large MCP
+ * payloads flood context unchecked. Re-firing the nudge every N calls
+ * keeps the guidance in the model's recent window without saturating it.
+ *
+ * Counter state is process-aware: in-memory Map for same-process callers,
+ * file-backed `<guidanceDir>/<type>.count` for cross-process hook
+ * invocations. On any IO/parse failure we fall back to firing — losing a
+ * counter is preferable to silently dropping the advisory.
+ */
+function guidancePeriodic(type, content, sessionId, period) {
+  const safePeriod = Math.max(1, period | 0);
+  const id = sessionId ? `s-${sessionId}` : defaultGuidanceId();
+  const key = `${id}::${type}`;
+
+  // Read counter from memory first; fall through to disk on miss.
+  let count = _guidanceCounters.get(key);
+  const dir = guidanceDirFor(sessionId);
+  const counterPath = resolve(dir, `${type}.count`);
+
+  if (count == null) {
+    try {
+      const parsed = Number.parseInt(readFileSync(counterPath, "utf8"), 10);
+      count = Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+    } catch {
+      count = 0;
+    }
+  }
+
+  const next = count + 1;
+  _guidanceCounters.set(key, next);
+
+  try {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(counterPath, String(next), "utf8");
+  } catch {
+    // Best-effort: cross-process counter may drift on FS failure, but we
+    // still return a decision based on the in-memory tick.
+  }
+
+  // Fire on the 1st, (period+1)th, (2·period+1)th… call.
+  if ((next - 1) % safePeriod !== 0) return null;
+  return { action: "context", additionalContext: content };
+}
+
+/**
  * Robust recursive delete. On Windows, `fs.rmSync` on directories under a
  * tmpdir whose path contains non-ASCII characters (e.g. a Chinese / Japanese /
  * Korean username) silently no-ops without throwing — see #454. Fall back to a
@@ -104,6 +213,7 @@ function rmSyncRobust(dir) {
 
 export function resetGuidanceThrottle(sessionId) {
   _guidanceShown.clear();
+  _guidanceCounters.clear();
   // Clear ppid-based dir (legacy / fallback callers) and the sessionId dir if given
   rmSyncRobust(guidanceDirFor());
   if (sessionId) {
@@ -184,12 +294,16 @@ const SAFE_COMMAND_PATTERNS = [
   /^cd(?:\s+[^\r\n]+)?$/,
   /^mkdir(?:\s+[^\r\n]+)?$/,
   /^touch\s+[^\r\n]+$/,
-  /^mv(?!\s+-[a-zA-Z]*v\b)(?!\s+--verbose\b)\s+[^\r\n]+$/,
-  /^cp(?!\s+-[a-zA-Z]*v\b)(?!\s+--verbose\b)\s+[^\r\n]+$/,
-  /^rm(?!\s+-[a-zA-Z]*v\b)(?!\s+--verbose\b)\s+[^\r\n]+$/,
+  // #517 follow-up: the original `(?!\s+-[a-zA-Z]*v\b)` required `v` to be
+  // the LAST alpha char in the flag bundle, so `-vs`, `-vfr`, `-rvf`,
+  // `-sfvr`, etc. silently slipped past the carve-out and flooded.
+  // `(?!\s+-[a-zA-Z]*v[a-zA-Z]*)` catches `v` anywhere in the bundle.
+  /^mv(?!\s+-[a-zA-Z]*v[a-zA-Z]*)(?!\s+--verbose\b)\s+[^\r\n]+$/,
+  /^cp(?!\s+-[a-zA-Z]*v[a-zA-Z]*)(?!\s+--verbose\b)\s+[^\r\n]+$/,
+  /^rm(?!\s+-[a-zA-Z]*v[a-zA-Z]*)(?!\s+--verbose\b)\s+[^\r\n]+$/,
   // ln (#517): silent on success — same `-v` / `--verbose` carve-out as
   // cp/mv/rm. Bulk symlink operations with -v flood one line per link.
-  /^ln(?!\s+-[a-zA-Z]*v\b)(?!\s+--verbose\b)\s+[^\r\n]+$/,
+  /^ln(?!\s+-[a-zA-Z]*v[a-zA-Z]*)(?!\s+--verbose\b)\s+[^\r\n]+$/,
   // ls — refuse recursive (-R / --recursive) to keep output bounded.
   /^ls(?!\s+-[a-zA-Z]*R)(?!\s+--recursive)(?:\s+[^\r\n]+)?$/,
   // git read-only / status subcommands
@@ -244,44 +358,136 @@ let securityInitFailed = false;
 /**
  * @returns {boolean} true if security module loaded successfully.
  *
- * Loud fail: if `build/security.js` is missing or fails to import, log a
- * clear stderr warning instead of swallowing the error silently. Without
- * this, user-configured `permissions.deny` patterns (#466) become no-ops
- * with no indication that policy enforcement is disabled — a fail-open
- * security regression.
+ * Loud fail: if neither the esbuild bundle nor `build/security.js` is
+ * importable, log a clear stderr warning instead of swallowing the error
+ * silently. Without this, user-configured `permissions.deny` patterns
+ * (#466) become no-ops with no indication that policy enforcement is
+ * disabled — a fail-open security regression.
+ *
+ * ─── Resolution order (#558) ───────────────────────────────────────────
+ *
+ *   1. `hooks/security.bundle.mjs` — esbuild output, sibling of routing.mjs's
+ *      parent. Marketplace installs (`git clone` install path) ship this
+ *      bundle via CI's `git add -f`, so it's the only artifact reliably
+ *      present across BOTH `npm install` (build/ generated by tsc) AND
+ *      marketplace install (build/ excluded by .gitignore, never built).
+ *
+ *   2. `<buildDir>/security.js` — tsc output. Present after `npm run build`.
+ *      Kept as a fallback so source checkouts that bypass `npm run bundle`
+ *      still degrade gracefully to the tsc-emitted module.
+ *
+ * Bundle path is computed from `import.meta.url` (sibling layout:
+ * `hooks/core/routing.mjs` → `hooks/security.bundle.mjs`).
+ * `CONTEXT_MODE_SECURITY_BUNDLE_PATH` is a test seam — it lets
+ * subprocess-based tests stage a bundle in tmpdir without polluting the
+ * repo's hooks/ directory.
  */
 export async function initSecurity(buildDir) {
-  try {
-    const { existsSync } = await import("node:fs");
-    const { resolve } = await import("node:path");
-    const { pathToFileURL } = await import("node:url");
-    const secPath = resolve(buildDir, "security.js");
-    if (!existsSync(secPath)) {
+  const { existsSync } = await import("node:fs");
+  const { resolve, dirname } = await import("node:path");
+  const { fileURLToPath, pathToFileURL } = await import("node:url");
+
+  // Default: <hooks/core/ dir>/../security.bundle.mjs → hooks/security.bundle.mjs.
+  const defaultBundlePath = resolve(
+    dirname(fileURLToPath(import.meta.url)),
+    "..",
+    "security.bundle.mjs",
+  );
+  const bundlePath = process.env.CONTEXT_MODE_SECURITY_BUNDLE_PATH || defaultBundlePath;
+  const secPath = resolve(buildDir, "security.js");
+
+  // Bundle-first: marketplace installs ship the bundle, never the build/ dir.
+  if (existsSync(bundlePath)) {
+    try {
+      security = await import(pathToFileURL(bundlePath).href);
+      return true;
+    } catch (err) {
       if (!securityInitFailed && !process.env.CONTEXT_MODE_SUPPRESS_SECURITY_WARNING) {
         process.stderr.write(
-          `[context-mode] WARNING: ${secPath} not found — security deny patterns will NOT be enforced. ` +
-            `Run \`npm run build\` to generate it. Set CONTEXT_MODE_SUPPRESS_SECURITY_WARNING=1 to silence.\n`,
+          `[context-mode] WARNING: failed to load security bundle (${bundlePath}) — deny patterns NOT enforced: ${err?.message ?? err}\n`,
         );
       }
       securityInitFailed = true;
       return false;
     }
-    security = await import(pathToFileURL(secPath).href);
-    return true;
-  } catch (err) {
-    if (!securityInitFailed && !process.env.CONTEXT_MODE_SUPPRESS_SECURITY_WARNING) {
-      process.stderr.write(
-        `[context-mode] WARNING: failed to load security module — deny patterns NOT enforced: ${err?.message ?? err}\n`,
-      );
-    }
-    securityInitFailed = true;
-    return false;
   }
+
+  // Fallback: tsc-emitted build/security.js (source checkout + `npm run build`).
+  if (existsSync(secPath)) {
+    try {
+      security = await import(pathToFileURL(secPath).href);
+      return true;
+    } catch (err) {
+      if (!securityInitFailed && !process.env.CONTEXT_MODE_SUPPRESS_SECURITY_WARNING) {
+        process.stderr.write(
+          `[context-mode] WARNING: failed to load security module — deny patterns NOT enforced: ${err?.message ?? err}\n`,
+        );
+      }
+      securityInitFailed = true;
+      return false;
+    }
+  }
+
+  // Neither artifact present — preserve fail-open with an actionable warning
+  // that mentions BOTH paths so users on either install model can self-diagnose.
+  if (!securityInitFailed && !process.env.CONTEXT_MODE_SUPPRESS_SECURITY_WARNING) {
+    process.stderr.write(
+      `[context-mode] WARNING: security module not found — security deny patterns will NOT be enforced.\n` +
+        `  Searched: ${bundlePath} (bundle) and ${secPath} (build).\n` +
+        `  Marketplace installs ship hooks/security.bundle.mjs via CI; for source checkouts run \`npm run bundle\` (or \`npm run build\`).\n` +
+        `  Set CONTEXT_MODE_SUPPRESS_SECURITY_WARNING=1 to silence.\n`,
+    );
+  }
+  securityInitFailed = true;
+  return false;
 }
 
 /** @returns {boolean} true if a previous initSecurity() call failed to load the module. */
 export function isSecurityInitFailed() {
   return securityInitFailed;
+}
+
+/**
+ * Build the agent-facing additionalContext block surfacing the security
+ * init failure (#558).
+ *
+ * Pre-558 the only signal of a fail-open security regression was a
+ * stderr WARNING line that adapters typically suppress / discard. The
+ * user had no in-band signal that `permissions.deny` was no-op'd.
+ *
+ * Returns a structured XML-ish block when initSecurity() has failed,
+ * `null` otherwise. SessionStart hooks append the block to their
+ * additionalContext so the agent (and through the agent, the user)
+ * sees the warning the next time they view the session — not just in
+ * suppressed stderr.
+ *
+ * The block format intentionally mirrors the `<context_guidance>`
+ * shape used elsewhere in routing so existing prompt-template
+ * scaffolding picks it up without special-casing.
+ */
+export function buildSecurityWarningContext() {
+  if (!securityInitFailed) return null;
+  return [
+    "<context_mode_security_warning>",
+    "  <severity>HIGH</severity>",
+    "  <issue>",
+    "    The context-mode security module failed to load.",
+    "    User-configured `permissions.deny` patterns are NOT being enforced.",
+    "    Bash commands and file operations bypass the deny gate (fail-open).",
+    "  </issue>",
+    "  <root_cause>",
+    "    `hooks/security.bundle.mjs` (and `build/security.js`) are absent or unloadable.",
+    "    Common on marketplace installs where `build/` is gitignored and the",
+    "    bundle was missing prior to v1.0.127.",
+    "  </root_cause>",
+    "  <fix>",
+    "    Run `npm run bundle` from the context-mode source checkout, OR",
+    "    upgrade context-mode to v1.0.127+ (which ships hooks/security.bundle.mjs",
+    "    via CI). To opt in to fail-CLOSED instead, set CONTEXT_MODE_REQUIRE_SECURITY=1.",
+    "    To silence this warning while you investigate, set CONTEXT_MODE_SUPPRESS_SECURITY_WARNING=1.",
+    "  </fix>",
+    "</context_mode_security_warning>",
+  ].join("\n");
 }
 
 /**
@@ -302,6 +508,14 @@ const TOOL_ALIASES = {
   "grep_search": "Grep",
   "search_file_content": "Grep",
   "web_fetch": "WebFetch",
+  "read_url_content": "WebFetch",
+  // Antigravity CLI (`agy`) native tool names. Keep in sync with the two other
+  // agy maps: hooks/antigravity-cli/payload.mjs (normalizeAgyToolName) and
+  // src/session/extract.ts (TOOL_NAME_NORMALIZE).
+  "run_command": "Bash",
+  "view_file": "Read",
+  "list_dir": "LS",
+  "search_web": "WebSearch",
   // Qwen Code additional tool names (no routing branch yet but normalized
   // so future routing logic works without per-platform fallback):
   "write_file": "Write",
@@ -358,6 +572,86 @@ function matchesContextModeTool(toolName, ctxName, legacyName) {
   return raw.includes("context-mode") && leaf === legacyName;
 }
 
+// External MCP detection (#529 + 15-adapter coverage follow-up).
+//
+// MCP-namespaced tool names follow per-platform conventions (see
+// core/tool-naming.mjs):
+//   - `mcp__<server>__<tool>`     Claude Code / Gemini CLI / Antigravity / Qwen Code / Codex
+//   - `MCP:<tool>`                Cursor
+//   - `@<server>/<tool>`          Kiro
+//
+// Tools belonging to context-mode itself are excluded — they have dedicated
+// routing branches above (ctx_execute, ctx_execute_file, ctx_batch_execute)
+// and re-routing them here would double-process the call.
+const MCP_PREFIX = "mcp__";
+const CURSOR_MCP_PREFIX = "MCP:";
+const KIRO_MCP_PREFIX = "@";
+const CTX_TOOL_PREFIX = "ctx_";
+const CONTEXT_MODE_SUBSTRING = "context-mode";
+
+function isExternalMcpTool(toolName) {
+  const raw = String(toolName ?? "");
+
+  // Claude / Codex / Gemini / Qwen / Antigravity wire shape.
+  if (raw.startsWith(MCP_PREFIX)) {
+    const server = raw.slice(MCP_PREFIX.length).split("__")[0];
+    if (!server) return false;
+    return !server.includes(CONTEXT_MODE_SUBSTRING);
+  }
+
+  // Cursor wire shape: `MCP:<tool>` — own tools are `MCP:ctx_*`. There is no
+  // server segment, so the discriminator is the tool-leaf prefix.
+  if (raw.startsWith(CURSOR_MCP_PREFIX)) {
+    const tool = raw.slice(CURSOR_MCP_PREFIX.length);
+    return tool.length > 0 && !tool.startsWith(CTX_TOOL_PREFIX);
+  }
+
+  // Kiro wire shape: `@<server>/<tool>` — own tools are `@context-mode/ctx_*`.
+  if (raw.startsWith(KIRO_MCP_PREFIX) && raw.includes("/")) {
+    const server = raw.slice(KIRO_MCP_PREFIX.length).split("/")[0];
+    if (!server) return false;
+    return !server.includes(CONTEXT_MODE_SUBSTRING);
+  }
+
+  return false;
+}
+
+function getShellCommand(toolInput) {
+  if (!toolInput || typeof toolInput !== "object") return "";
+  if (typeof toolInput.command === "string") return toolInput.command;
+  if (typeof toolInput.cmd === "string") return toolInput.cmd;
+  if (typeof toolInput.CommandLine === "string") return toolInput.CommandLine;
+  return "";
+}
+
+function getReadFilePath(toolInput) {
+  if (!toolInput || typeof toolInput !== "object") return "";
+  if (typeof toolInput.file_path === "string") return toolInput.file_path;
+  if (typeof toolInput.path === "string") return toolInput.path;
+  if (typeof toolInput.AbsolutePath === "string") return toolInput.AbsolutePath;
+  if (typeof toolInput.FilePath === "string") return toolInput.FilePath;
+  return "";
+}
+
+function getWebFetchUrl(toolInput) {
+  if (!toolInput || typeof toolInput !== "object") return "";
+  if (typeof toolInput.url === "string") return toolInput.url;
+  if (typeof toolInput.URL === "string") return toolInput.URL;
+  if (typeof toolInput.Url === "string") return toolInput.Url;
+  return "";
+}
+
+function getCodexConfigDir(env = process.env) {
+  const codexHome = env.CODEX_HOME;
+  if (codexHome && codexHome.trim() !== "") return resolve(codexHome);
+  return resolve(homedir(), ".codex");
+}
+
+function getPlatformSettingsPath(platform) {
+  if (platform === "codex") return resolve(getCodexConfigDir(), "settings.json");
+  return undefined;
+}
+
 /**
  * Route a PreToolUse event. Returns normalized decision object or null for passthrough.
  *
@@ -368,8 +662,14 @@ function matchesContextModeTool(toolName, ctxName, legacyName) {
  * @param {string} [sessionId] - Stable session identifier from hook payload. When
  *   provided, the guidance throttle uses it to scope marker files across hook
  *   invocations even when process.ppid shifts (Windows/Git Bash — see #298).
+ * @param {object} [options] - Runtime routing context from the adapter.
+ * @param {boolean} [options.mcpToolsAvailable=true] - False when the current
+ *   caller context cannot invoke ctx_* MCP tools even though an MCP server is
+ *   live on the machine (Claude Code fixed-tool subagents — #794).
  */
-export function routePreToolUse(toolName, toolInput, projectDir, platform, sessionId) {
+export function routePreToolUse(toolName, toolInput, projectDir, platform, sessionId, options = {}) {
+  const mcpToolsAvailable = options.mcpToolsAvailable !== false;
+
   // ─── Opt-in fail-closed gate (#468 follow-up) ───
   // Default behavior on security-module load failure is fail-OPEN (a stderr
   // warning is emitted but routing continues). Security-conscious users can
@@ -398,17 +698,18 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
 
   // Normalize platform-specific tool name to canonical
   const canonical = TOOL_ALIASES[toolName] ?? toolName;
+  const platformSettingsPath = getPlatformSettingsPath(platform);
 
   // ─── Bash: Stage 1 security check, then Stage 2 routing ───
   if (canonical === "Bash") {
-    const command = toolInput.command ?? "";
+    const command = getShellCommand(toolInput);
 
     // Stage 1: Security check against user's deny/allow patterns.
     // Only act when an explicit pattern matched. When no pattern matches,
     // evaluateCommand returns { decision: "ask" } with no matchedPattern —
     // in that case fall through so other hooks and the platform's native engine can decide.
     if (security) {
-      const policies = security.readBashPolicies(projectDir);
+      const policies = security.readBashPolicies(projectDir, platformSettingsPath);
       if (policies.length > 0) {
         const result = security.evaluateCommand(command, policies);
         if (result.decision === "deny") {
@@ -467,7 +768,7 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
         return mcpRedirect({
           action: "modify",
           updatedInput: {
-            command: `echo "context-mode: curl/wget blocked. Think in Code — use ${t("ctx_execute")}(language, code) to write code that fetches, processes, and prints only the answer. Or use ${t("ctx_fetch_and_index")}(url, source) to fetch and index. Write pure JS with try/catch, no npm deps. Do NOT retry with curl/wget."`,
+            command: `echo "context-mode: curl/wget redirected. Call ${t("ctx_execute")}(language, code) to fetch the URL, derive your answer in code, and print only the result — the raw HTTP body stays in the sandbox instead of entering your conversation. Or call ${t("ctx_fetch_and_index")}(url, source) when you want to query the response later via ${t("ctx_search")}. Both have full network access. Retry the same call on a transient DNS error (EAI_AGAIN, ETIMEDOUT, ENETUNREACH)."`,
           },
           // D2 PRD Phase 3.1: marker payload for PostToolUse byte accounting.
           redirectMeta: {
@@ -478,7 +779,7 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
             bytesAvoided: 8192,
             commandSummary: command.slice(0, 200),
           },
-        });
+        }, mcpToolsAvailable);
       }
       // All segments safe → allow through
       return null;
@@ -498,9 +799,9 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
       return mcpRedirect({
         action: "modify",
         updatedInput: {
-          command: `echo "context-mode: Inline HTTP blocked. Think in Code — use ${t("ctx_execute")}(language, code) to write code that fetches, processes, and console.log() only the result. Write robust pure JS with try/catch, no npm deps. Do NOT retry with Bash."`,
+          command: `echo "context-mode: Inline HTTP redirected. Call ${t("ctx_execute")}(language, code) to fetch, derive your answer in code, and console.log() only the result — the raw response body stays in the sandbox instead of entering your conversation. Full network access. Retry the same call on a transient DNS error (EAI_AGAIN, ETIMEDOUT, ENETUNREACH)."`,
         },
-      });
+      }, mcpToolsAvailable);
     }
 
     // Build tools (gradle, maven, sbt) → redirect to execute sandbox (Issue #38, #406).
@@ -511,9 +812,9 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
       return mcpRedirect({
         action: "modify",
         updatedInput: {
-          command: `echo "context-mode: Build tool redirected. Think in Code — use ${t("ctx_execute")}(language: \\"shell\\", code: \\"${safeCmd} 2>&1 | tail -30\\") to run and print only errors/summary. Do NOT retry with Bash."`,
+          command: `echo "context-mode: Build tool redirected. Call ${t("ctx_execute")}(language: \\"shell\\", code: \\"${safeCmd} 2>&1 | tail -30\\") to run the build and print only the tail — the verbose build log stays in the sandbox instead of entering your conversation. For more targeted output, replace \\"tail -30\\" with \\"grep -E '(error|warning|FAIL|✗|×)'\\" or similar, so only the lines that matter come back."`,
         },
-      });
+      }, mcpToolsAvailable);
     }
 
     // Skip the routing nudge for commands whose output is structurally
@@ -521,6 +822,17 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
     // Conservative: any pipe/redirect/chain disqualifies, unknown commands
     // still get the nudge.
     if (isStructurallyBounded(command)) {
+      return null;
+    }
+
+    // #817: opt-in size threshold. When the operator configures
+    // CONTEXT_MODE_BASH_NUDGE_MIN_COMMAND_BYTES, a short unbounded command is
+    // treated as expected-lightweight and passes through untouched — reserving
+    // the nudge for commands large/complex enough to plausibly flood context.
+    // Default (0) preserves current behavior, so large-output savings are not
+    // weakened unless the operator explicitly opts in.
+    const minCommandBytes = getBashNudgeMinCommandBytes();
+    if (minCommandBytes > 0 && Buffer.byteLength(command, "utf8") < minCommandBytes) {
       return null;
     }
 
@@ -534,7 +846,7 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
   // event with the actual file size as bytes_avoided. Threshold = 50 000 bytes;
   // smaller reads stay on the existing one-shot guidance nudge.
   if (canonical === "Read") {
-    const filePath = toolInput.file_path ?? toolInput.path ?? "";
+    const filePath = getReadFilePath(toolInput);
     if (filePath) {
       try {
         const st = statSync(filePath);
@@ -561,10 +873,10 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
 
   // ─── WebFetch: deny + redirect to sandbox ───
   if (canonical === "WebFetch") {
-    const url = toolInput.url ?? "";
+    const url = getWebFetchUrl(toolInput);
     return mcpRedirect({
       action: "deny",
-      reason: `context-mode: WebFetch blocked. Think in Code — use ${t("ctx_fetch_and_index")}(url: "${url}", source: "...") to fetch and index, then ${t("ctx_search")}(queries: [...]) to query. Or use ${t("ctx_execute")}(language, code) to fetch, process, and console.log() only what you need. Write pure JS, no npm deps. Do NOT use curl, wget, or WebFetch.`,
+      reason: `context-mode: WebFetch redirected. Call ${t("ctx_fetch_and_index")}(url: "${url}", source: "...") to fetch + index the page, then ${t("ctx_search")}(queries: [...]) to query the indexed content — the raw page bytes stay in storage instead of entering your conversation. Or call ${t("ctx_execute")}(language, code) when you want to derive your answer in one round trip (parse, extract, count) without persisting the response. Both have full network access. Retry the same call on a transient DNS error (EAI_AGAIN, ETIMEDOUT, ENETUNREACH).`,
       // D2 PRD Phase 4.1: marker payload for PostToolUse byte accounting.
       redirectMeta: {
         tool: "WebFetch",
@@ -574,7 +886,7 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
         bytesAvoided: 16384,
         commandSummary: String(url).slice(0, 200),
       },
-    });
+    }, mcpToolsAvailable);
   }
 
   // ─── Agent: inject context-mode routing into subagent prompts ───
@@ -585,7 +897,15 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
     const fieldName = ["prompt", "request", "objective", "question", "query", "task"].find(f => f in toolInput) ?? "prompt";
     const prompt = toolInput[fieldName] ?? "";
 
-    const subagentBlock = createRoutingBlock(t, { includeCommands: false });
+    // Claude Code surfaces ctx_* as DEFERRED tools (schemas loaded via ToolSearch).
+    // Without a bootstrap step the subagent is told to use ctx_* tools it cannot yet
+    // invoke and stalls (see #724). Prepend the ToolSearch bootstrap for claude-code
+    // (the default when platform is unset). Other platforms don't defer, so skip it.
+    const isClaudeCode = !platform || platform === "claude-code";
+    const subagentBlock = createRoutingBlock(t, {
+      includeCommands: false,
+      toolSearchBootstrap: isClaudeCode,
+    });
 
     const updatedInput =
       subagentType === "Bash"
@@ -597,10 +917,15 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
 
   // ─── MCP execute: security check for shell commands ───
   // Match bare, generic MCP, and legacy context-mode execute tool names.
+  const shouldPinClaudeExecutorCwd =
+    platform === "claude-code" &&
+    typeof projectDir === "string" &&
+    projectDir.length > 0;
+
   if (matchesContextModeTool(toolName, "ctx_execute", "execute")) {
     if (security && toolInput.language === "shell") {
       const code = toolInput.code ?? "";
-      const policies = security.readBashPolicies(projectDir);
+      const policies = security.readBashPolicies(projectDir, platformSettingsPath);
       if (policies.length > 0) {
         const result = security.evaluateCommand(code, policies);
         if (result.decision === "deny") {
@@ -611,6 +936,9 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
         }
       }
     }
+    if (toolInput.language === "shell" && shouldPinClaudeExecutorCwd && typeof toolInput.cwd !== "string") {
+      return { action: "modify", updatedInput: { ...toolInput, cwd: projectDir } };
+    }
     return null;
   }
 
@@ -619,7 +947,7 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
     if (security) {
       // Check file path against Read deny patterns
       const filePath = toolInput.path ?? "";
-      const denyGlobs = security.readToolDenyPatterns("Read", projectDir);
+      const denyGlobs = security.readToolDenyPatterns("Read", projectDir, platformSettingsPath);
       const evalResult = security.evaluateFilePath(filePath, denyGlobs);
       if (evalResult.denied) {
         return { action: "deny", reason: `Blocked by security policy: file path matches Read deny pattern ${evalResult.matchedPattern}` };
@@ -629,7 +957,7 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
       const lang = toolInput.language ?? "";
       const code = toolInput.code ?? "";
       if (lang === "shell") {
-        const policies = security.readBashPolicies(projectDir);
+        const policies = security.readBashPolicies(projectDir, platformSettingsPath);
         if (policies.length > 0) {
           const result = security.evaluateCommand(code, policies);
           if (result.decision === "deny") {
@@ -648,7 +976,7 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
   if (matchesContextModeTool(toolName, "ctx_batch_execute", "batch_execute")) {
     if (security) {
       const commands = toolInput.commands ?? [];
-      const policies = security.readBashPolicies(projectDir);
+      const policies = security.readBashPolicies(projectDir, platformSettingsPath);
       if (policies.length > 0) {
         for (const entry of commands) {
           const cmd = entry.command ?? "";
@@ -662,7 +990,26 @@ export function routePreToolUse(toolName, toolInput, projectDir, platform, sessi
         }
       }
     }
+    if (shouldPinClaudeExecutorCwd && typeof toolInput.cwd !== "string") {
+      return { action: "modify", updatedInput: { ...toolInput, cwd: projectDir } };
+    }
     return null;
+  }
+
+  // ─── External MCP tools: periodic guidance about routing large payloads ─── (#529, #567 follow-up)
+  // hooks/hooks.json registers a `mcp__(?!plugin_context-mode_)` matcher so this
+  // branch fires for slack/telegram/gdrive/notion-style MCPs whose results would
+  // otherwise spill into context. We don't deny or modify — the agent still needs
+  // the tool's output; we just nudge it to pipe large results through ctx_execute.
+  //
+  // Cadence: every N calls (default 10, tunable via CONTEXT_MODE_EXTERNAL_MCP_NUDGE_EVERY).
+  // The original one-shot nudge (#529) was lost after context compaction in
+  // MCP-heavy sessions (e.g. 50+ Jira calls in #567 follow-up), letting later
+  // payloads flood context unchecked. Re-firing periodically keeps the guidance
+  // in the model's recent window without saturating it.
+  if (isExternalMcpTool(toolName)) {
+    const externalMcpGuidance = platform ? createExternalMcpGuidance(t) : EXTERNAL_MCP_GUIDANCE;
+    return guidancePeriodic("external-mcp", externalMcpGuidance, sessionId, getExternalMcpNudgeEvery());
   }
 
   // Unknown tool — pass through

@@ -26,7 +26,7 @@
  */
 
 import { describe, it, expect } from "vitest";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 const REPO_ROOT = resolve(__dirname, "..", "..");
@@ -66,6 +66,15 @@ describe(".codex-plugin/mcp.json", () => {
     expect(entry.cwd).toBe(".");
   });
 
+  it("sets CONTEXT_MODE_PLATFORM=codex for the MCP server process", () => {
+    // Codex hook wrappers already set this before loading shared hook code.
+    // The MCP server needs the same signal so storage and doctor output do
+    // not fall back to ~/.claude on machines that have both agents installed.
+    const servers = mcp.mcpServers as Record<string, { env?: Record<string, string> }>;
+    const entry = servers["context-mode"];
+    expect(entry.env?.CONTEXT_MODE_PLATFORM).toBe("codex");
+  });
+
   it("does NOT use `${CODEX_PLUGIN_ROOT}` placeholders (no var expansion happens)", () => {
     const raw = readFileSync(resolve(REPO_ROOT, ".codex-plugin/mcp.json"), "utf8");
     expect(raw).not.toMatch(/\$\{[^}]*PLUGIN_ROOT[^}]*\}/);
@@ -87,18 +96,46 @@ describe(".codex-plugin/plugin.json", () => {
   });
 });
 
-describe(".codex-plugin/marketplace.json", () => {
-  const marketplace = readJson(".codex-plugin/marketplace.json") as {
-    metadata?: { version?: string };
-    plugins?: Array<{ version?: string }>;
+describe(".codex-plugin/hooks.json", () => {
+  const hooksPath = resolve(REPO_ROOT, ".codex-plugin/hooks.json");
+  const hooks = readJson(".codex-plugin/hooks.json") as {
+    hooks: Record<string, Array<{ hooks: Array<{ command: string }> }>>;
   };
-  const pkg = readJson("package.json");
 
-  it("metadata.version matches package.json", () => {
-    expect(marketplace.metadata?.version).toBe(pkg.version);
+  it("ships the Codex plugin hooks manifest", () => {
+    expect(existsSync(hooksPath)).toBe(true);
   });
 
-  it("plugin entry version matches package.json", () => {
-    expect(marketplace.plugins?.[0]?.version).toBe(pkg.version);
+  it("uses simple plugin-root hook script commands", () => {
+    for (const groups of Object.values(hooks.hooks)) {
+      const command = groups[0]?.hooks[0]?.command ?? "";
+      expect(command).toContain('node "${PLUGIN_ROOT}/hooks/codex/');
+    }
+  });
+
+  it("sets CONTEXT_MODE_PLATFORM=codex in hook wrapper modules", () => {
+    const platformSource = readFileSync(resolve(REPO_ROOT, "hooks/codex/platform.mjs"), "utf8");
+    expect(platformSource).toContain('process.env.CONTEXT_MODE_PLATFORM = "codex";');
+
+    for (const groups of Object.values(hooks.hooks)) {
+      const command = groups[0]?.hooks[0]?.command ?? "";
+      const match = command.match(/\$\{PLUGIN_ROOT\}\/(hooks\/codex\/[^"]+\.mjs)/);
+      expect(match, `expected codex hook script path in ${command}`).not.toBeNull();
+
+      const hookSource = readFileSync(resolve(REPO_ROOT, match![1]), "utf8");
+      const platformImport = hookSource.indexOf('import "./platform.mjs";');
+      const firstSharedImport = hookSource.indexOf('import "../');
+      expect(platformImport).toBeGreaterThanOrEqual(0);
+      expect(firstSharedImport).toBeGreaterThan(platformImport);
+    }
   });
 });
+
+// `.codex-plugin/marketplace.json` was intentionally removed — Codex CLI's
+// MARKETPLACE_MANIFEST_RELATIVE_PATHS at
+// refs/platforms/codex/codex-rs/core-plugins/src/marketplace.rs:21 lists
+// only `.agents/plugins/marketplace.json` and `.claude-plugin/marketplace.json`.
+// Shipping under `.codex-plugin/` was dead weight that never resolved a
+// plugin and historically misled contributors. The Codex-discoverable
+// marketplace now lives at `.agents/plugins/marketplace.json`, and its
+// layout contract is pinned in `tests/codex/marketplace-layout.test.ts`.

@@ -35,7 +35,8 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { SessionDB } from "../../session/db.js";
+import { resolveContextModeDataRoot } from "../base.js";
+import { resolveSessionDbPath, SessionDB } from "../../session/db.js";
 import { OpenClawSessionDB } from "./session-db.js";
 import { extractEvents, extractUserEvents } from "../../session/extract.js";
 import type { HookInput } from "../../session/extract.js";
@@ -43,6 +44,7 @@ import { buildResumeSnapshot } from "../../session/snapshot.js";
 import type { SessionEvent } from "../../types.js";
 
 import { WorkspaceRouter } from "./workspace-router.js";
+import { handleOpenclawUsageEvent } from "./usage.js";
 import { buildNodeCommand } from "../types.js";
 import { OPENCLAW_TOOL_DEFS } from "./mcp-tools.js";
 import type { OpenClawToolDef } from "./mcp-tools.js";
@@ -56,12 +58,54 @@ const SYSTEM_REMINDER_PREFIXES = [
   "<context_guidance>",
   "<tool-result>",
 ] as const;
+const SKILL_FRONTMATTER_REGEX = /^---\s*\n[\s\S]*?\n---\s*\n?/;
+const OPENCLAW_SKILL_PROMPT_CHAR_LIMIT = 6000;
+const SKILL_SECTION_HEADINGS = [
+  "MANDATORY RULE",
+  "Decision Tree",
+  "When to Use Each Tool",
+  "Critical Rules",
+] as const;
 function isSystemReminderMessage(msg: string): boolean {
   const trimmed = msg.trimStart();
   for (const prefix of SYSTEM_REMINDER_PREFIXES) {
     if (trimmed.startsWith(prefix)) return true;
   }
   return false;
+}
+function stripMarkdownFrontmatter(markdown: string): string {
+  const normalized = markdown.replace(/\r\n/g, "\n");
+  return normalized.replace(SKILL_FRONTMATTER_REGEX, "").trim();
+}
+function extractMarkdownSection(markdown: string, heading: string): string | null {
+  const sectionHeader = `## ${heading}`;
+  const start = markdown.indexOf(sectionHeader);
+  if (start === -1) return null;
+  const afterHeader = markdown.slice(start + sectionHeader.length);
+  const nextHeadingOffset = afterHeader.search(/\n##\s+|\n#\s+/);
+  const body = (nextHeadingOffset === -1 ? afterHeader : afterHeader.slice(0, nextHeadingOffset)).trim();
+  if (!body) return null;
+  return `${sectionHeader}\n\n${body}`;
+}
+function buildOpenClawSkillLikeGuidance(skillMarkdown: string): string {
+  const skillBody = stripMarkdownFrontmatter(skillMarkdown);
+  const skillTitle = skillBody.match(/^#\s+.+$/m)?.[0]?.trim() ?? "# Context Mode Skill";
+  const selectedSections = SKILL_SECTION_HEADINGS
+    .map((heading) => extractMarkdownSection(skillBody, heading))
+    .filter((section): section is string => Boolean(section));
+  const rawContent = (
+    selectedSections.length > 0
+      ? [skillTitle, ...selectedSections].join("\n\n")
+      : skillBody
+  ).trim();
+  const boundedContent = rawContent.length > OPENCLAW_SKILL_PROMPT_CHAR_LIMIT
+    ? `${rawContent.slice(0, OPENCLAW_SKILL_PROMPT_CHAR_LIMIT).trimEnd()}\n\n[skill excerpt truncated for prompt budget]`
+    : rawContent;
+  return [
+    "<context_mode_skill_like_guidance source=\"skills/context-mode/SKILL.md\">",
+    boundedContent,
+    "</context_mode_skill_like_guidance>",
+  ].join("\n");
 }
 
 // ── OpenClaw Plugin API Types ─────────────────────────────
@@ -76,9 +120,17 @@ interface CommandContext {
   config?: Record<string, unknown>;
 }
 
+interface OpenClawCommandDefinition {
+  name: string;
+  description: string;
+  acceptsArgs?: boolean;
+  requireAuth?: boolean;
+  handler: (ctx: CommandContext) => { text: string } | Promise<{ text: string }>;
+}
+
 /** OpenClaw plugin API provided to the register function. */
 interface OpenClawPluginApi {
-  registerHook(
+  registerHook?(
     event: string,
     handler: (...args: unknown[]) => unknown,
     meta: { name: string; description: string },
@@ -93,14 +145,8 @@ interface OpenClawPluginApi {
     handler: (...args: unknown[]) => unknown,
     opts?: { priority?: number },
   ): void;
-  registerContextEngine(id: string, factory: () => ContextEngineInstance): void;
-  registerCommand?(cmd: {
-    name: string;
-    description: string;
-    acceptsArgs?: boolean;
-    requireAuth?: boolean;
-    handler: (ctx: CommandContext) => { text: string } | Promise<{ text: string }>;
-  }): void;
+  registerContextEngine?(id: string, factory: () => ContextEngineInstance): void;
+  registerCommand?: (cmd: OpenClawCommandDefinition) => void;
   registerCli?(
     factory: (ctx: { program: unknown }) => void,
     meta: { commands: string[] },
@@ -111,6 +157,16 @@ interface OpenClawPluginApi {
    * the type so we degrade silently on legacy hosts that pre-date this API.
    */
   registerTool?(tool: OpenClawToolDef, opts?: { optional?: boolean }): void;
+  /**
+   * Subscribe to the openclaw diagnostic-event bus (`model.usage` carries
+   * per-turn token usage + pre-computed costUsd — diagnostic-events.ts:1156).
+   * Some hosts surface `onDiagnosticEvent` directly on the activation `api`;
+   * others expose it only as a module export from
+   * `openclaw/plugin-sdk/diagnostic-runtime`. Typed loosely + optional so the
+   * plugin compiles and runs whether or not the host provides it (the SDK is
+   * not a dependency of this repo). Returns an unsubscribe function.
+   */
+  onDiagnosticEvent?(listener: (evt: unknown) => void): (() => void) | void;
   logger?: {
     info: (...args: unknown[]) => void;
     error: (...args: unknown[]) => void;
@@ -186,22 +242,32 @@ const configSchema = {
 // ── Helpers ───────────────────────────────────────────────
 
 function getSessionDir(): string {
-  const dir = join(
-    homedir(),
-    ".openclaw",
-    "context-mode",
-    "sessions",
-  );
+  // Issue #649: honor CONTEXT_MODE_DATA_DIR universal storage override
+  // ahead of the hardcoded ~/.openclaw root so dev-container/CI/NFS-home
+  // users can relocate context-mode storage without patching the source.
+  // Kept in sync with OpenClawAdapter.getSessionDir() (inherited from
+  // BaseAdapter) — both call sites must agree byte-for-byte.
+  const override = resolveContextModeDataRoot();
+  const dir = override
+    ? join(override, "context-mode", "sessions")
+    : join(homedir(), ".openclaw", "context-mode", "sessions");
   mkdirSync(dir, { recursive: true });
   return dir;
 }
 
+// Issue #645 follow-up — route through the canonical per-project
+// resolver the MCP server uses (src/server.ts ctx_stats / ctx_search
+// timeline). The previous raw `sha256(projectDir).slice(0, 16)` shape
+// produced a different file from the `<canonical-hash>.db` the server
+// reads on darwin/win32 (case-fold) and inside linked worktrees
+// (suffix). The result was silent degradation of `ctx_stats` (zero
+// history) and `ctx_search(sort: "timeline")` (sort dropped) for any
+// OpenClaw user with an uppercase character in their projectDir.
+// Mirrors the matching Pi (src/adapters/pi/extension.ts:223) and OMP
+// (src/adapters/omp/plugin.ts:90) fixes, and the opencode plugin
+// pattern (src/adapters/opencode/plugin.ts:307).
 function getDBPath(projectDir: string): string {
-  const hash = createHash("sha256")
-    .update(projectDir)
-    .digest("hex")
-    .slice(0, 16);
-  return join(getSessionDir(), `${hash}.db`);
+  return resolveSessionDbPath({ projectDir, sessionsDir: getSessionDir() });
 }
 
 // ── Module-level DB singleton ─────────────────────────────
@@ -209,10 +275,22 @@ function getDBPath(projectDir: string): string {
 // Lazy-initialized on first register() using the first projectDir seen.
 // Uses OpenClawSessionDB for session_key mapping and rename support.
 let _dbSingleton: OpenClawSessionDB | null = null;
+let _dbSingletonPath = "";
 function getOrCreateDB(projectDir: string): OpenClawSessionDB {
-  if (!_dbSingleton) {
-    const dbPath = getDBPath(projectDir);
+  // Reopen the singleton if the resolved DB path changes. Production
+  // code normally loads the plugin once per process with a single
+  // workspace, but defensive re-keying on resolved path keeps the
+  // contract honest if a host ever calls register() twice with
+  // different projectDirs, and removes a subtle test-isolation
+  // foot-gun where a stale singleton pointed at a prior test's
+  // `<hash>.db`. Mirrors the Pi/OMP fix (#645).
+  const dbPath = getDBPath(projectDir);
+  if (!_dbSingleton || _dbSingletonPath !== dbPath) {
+    if (_dbSingleton) {
+      try { _dbSingleton.close(); } catch { /* best effort */ }
+    }
     _dbSingleton = new OpenClawSessionDB({ dbPath });
+    _dbSingletonPath = dbPath;
     _dbSingleton.cleanupOldSessions(7);
   }
   return _dbSingleton;
@@ -250,10 +328,40 @@ export default {
     // info/error always emit; debug only when api.logger.debug is present
     // (i.e. OpenClaw running with --log-level debug or lower).
     const log = {
-      info: (...args: unknown[]) => api.logger?.info("[context-mode]", ...args),
-      error: (...args: unknown[]) => api.logger?.error("[context-mode]", ...args),
+      info: (...args: unknown[]) => api.logger?.info?.("[context-mode]", ...args),
+      error: (...args: unknown[]) => api.logger?.error?.("[context-mode]", ...args),
       debug: (...args: unknown[]) => api.logger?.debug?.("[context-mode]", ...args),
       warn: (...args: unknown[]) => api.logger?.warn?.("[context-mode]", ...args),
+    };
+
+    const registerCommandHook = (
+      event: string,
+      handler: () => Promise<void> | void,
+      meta: { name: string; description: string },
+    ): void => {
+      if (api.registerHook) {
+        api.registerHook(event, handler, meta);
+        return;
+      }
+      try {
+        api.on(event, handler as (...args: unknown[]) => unknown);
+        log.debug("command hook registered via api.on fallback", { event });
+      } catch (err) {
+        log.warn?.("command hook registration skipped", { event }, err);
+      }
+    };
+
+    const registerAutoReplyCommand = (command: OpenClawCommandDefinition): void => {
+      if (!api.registerCommand) return;
+      try {
+        api.registerCommand(command);
+      } catch (err) {
+        log.warn?.(
+          "registerCommand failed; skipping auto-reply command",
+          { name: command.name },
+          err,
+        );
+      }
     };
 
     // Get shared DB singleton (lazy-init on first register() call)
@@ -279,6 +387,7 @@ export default {
     // with createRoutingBlock(createToolNamer("openclaw")) so OpenClaw-specific
     // MCP-prefix substitution stays in lockstep with hooks/routing-block.mjs.
     let routingInstructions = "";
+    let skillLikeInstructions = "";
     const initPromise = (async () => {
       const routingPath = resolve(buildDir, "..", "..", "..", "hooks", "core", "routing.mjs");
       const routing = await import(pathToFileURL(routingPath).href);
@@ -316,6 +425,17 @@ export default {
         } catch {
           // best effort
         }
+      }
+
+      try {
+        const skillPath = resolve(pluginRoot, "skills", "context-mode", "SKILL.md");
+        if (existsSync(skillPath)) {
+          skillLikeInstructions = buildOpenClawSkillLikeGuidance(readFileSync(skillPath, "utf-8"));
+        } else {
+          log.debug("context-mode skill file missing; skipping skill-like prompt injection", { skillPath });
+        }
+      } catch (err) {
+        log.warn?.("failed to build skill-like guidance from SKILL.md", err);
       }
 
       return { routing };
@@ -440,9 +560,66 @@ export default {
       },
     );
 
+    // ── 2b. model.usage — Per-turn token + cost capture ──────
+    // openclaw emits a first-class `model.usage` diagnostic event once per turn
+    // carrying the full usage breakdown + a pre-computed costUsd. We subscribe
+    // to the diagnostic-event bus (NOT the tool-call hook — before/after_tool_call
+    // carry approval/policy data only, no token usage). The handler
+    // (handleOpenclawUsageEvent) is decoupled + unit-tested; it parses → builds →
+    // inserts and never throws.
+    //
+    // tsc-safe SDK access: `onDiagnosticEvent` comes from the openclaw plugin SDK
+    // (`openclaw/plugin-sdk/diagnostic-runtime`), which is NOT in this repo's
+    // node_modules — a static import would break the build. We resolve it at
+    // runtime two ways, both best-effort:
+    //   1. directly off the activation `api` if the host surfaces it there;
+    //   2. otherwise a guarded dynamic import via a COMPUTED specifier string
+    //      (TS treats it as Promise<any> and skips module resolution, mirroring
+    //      the pathToFileURL(...).href dynamic imports above). Missing SDK → no-op.
+    const subscribeDiagnostics = (
+      onDiag: (listener: (evt: unknown) => void) => unknown,
+    ): void => {
+      try {
+        onDiag((evt: unknown) => {
+          try {
+            const sid = sessionId; // snapshot to avoid race with session_start re-key
+            handleOpenclawUsageEvent(evt, (e) => db.insertEvent(sid, e as SessionEvent, "Diagnostic"));
+          } catch {
+            // Usage capture must never break the agent turn.
+          }
+        });
+        log.debug("model.usage diagnostic subscription registered");
+      } catch (err) {
+        log.warn?.("model.usage diagnostic subscription failed", err);
+      }
+    };
+
+    if (typeof api.onDiagnosticEvent === "function") {
+      subscribeDiagnostics(api.onDiagnosticEvent.bind(api));
+    } else {
+      // Computed specifier so NodeNext does not try to resolve the (absent) SDK
+      // module at build time — the dynamic import is typed as Promise<any>.
+      const diagnosticRuntimeSpecifier = ["openclaw", "plugin-sdk", "diagnostic-runtime"].join("/");
+      void (async () => {
+        try {
+          const mod = (await import(diagnosticRuntimeSpecifier)) as {
+            onDiagnosticEvent?: (listener: (evt: unknown) => void) => unknown;
+          };
+          if (typeof mod?.onDiagnosticEvent === "function") {
+            subscribeDiagnostics(mod.onDiagnosticEvent);
+          } else {
+            log.debug("diagnostic-runtime loaded but onDiagnosticEvent missing");
+          }
+        } catch {
+          // SDK not installed (dev/test) — usage capture silently inert.
+          log.debug("openclaw plugin-sdk/diagnostic-runtime unavailable — usage capture inert");
+        }
+      })();
+    }
+
     // ── 3. command:new — Session initialization ────────────
 
-    api.registerHook(
+    registerCommandHook(
       "command:new",
       async () => {
         try {
@@ -461,7 +638,7 @@ export default {
 
     // ── 3b. command:reset / command:stop — Session cleanup ────
 
-    api.registerHook(
+    registerCommandHook(
       "command:reset",
       async () => {
         try {
@@ -476,8 +653,7 @@ export default {
         description: "Session cleanup on /reset command",
       },
     );
-
-    api.registerHook(
+    registerCommandHook(
       "command:stop",
       async () => {
         try {
@@ -641,13 +817,21 @@ export default {
     api.on(
       "before_prompt_build",
       () => {
-        if (!routingInstructions) return undefined;
-        log.debug("before_prompt_build[routing]", { hasInstructions: !!routingInstructions });
-        // v1.0.107 — visible marker so OpenClaw users can verify the routing
-        // block reached the model (Mickey-class verification path; mirrors
-        // OpenCode + Pi adapters).
-        const marker = `<!-- context-mode: routing block injected (sessionID=${String(sessionId).slice(0, 8)}) -->`;
-        return { appendSystemContext: marker + "\n" + routingInstructions };
+        if (!routingInstructions && !skillLikeInstructions) return undefined;
+        log.debug("before_prompt_build[routing+skill]", {
+          hasRoutingInstructions: !!routingInstructions,
+          hasSkillLikeInstructions: !!skillLikeInstructions,
+        });
+        const injectedBlocks: string[] = [];
+        if (routingInstructions) {
+          // v1.0.107 — visible marker so OpenClaw users can verify the routing
+          // block reached the model (Mickey-class verification path; mirrors
+          // OpenCode + Pi adapters).
+          const marker = `<!-- context-mode: routing block injected (sessionID=${String(sessionId).slice(0, 8)}) -->`;
+          injectedBlocks.push(marker + "\n" + routingInstructions);
+        }
+        if (skillLikeInstructions) injectedBlocks.push(skillLikeInstructions);
+        return { appendSystemContext: injectedBlocks.join("\n\n") };
       },
       { priority: 5 },
     );
@@ -705,13 +889,19 @@ export default {
         try {
           const e = (event ?? {}) as { input?: { prompt?: string } };
           const basePrompt = e?.input?.prompt ?? "";
-          if (!routingInstructions) return undefined;
+          if (!routingInstructions && !skillLikeInstructions) return undefined;
+          const injectedBlocks: string[] = [];
+          if (routingInstructions) injectedBlocks.push(routingInstructions);
+          if (skillLikeInstructions) injectedBlocks.push(skillLikeInstructions);
+          const injectedPromptBlock = injectedBlocks.join("\n\n");
           const newPrompt = basePrompt
-            ? `${basePrompt}\n\n${routingInstructions}`
-            : routingInstructions;
-          log.debug("subagent_spawning[inject-routing]", {
+            ? `${basePrompt}\n\n${injectedPromptBlock}`
+            : injectedPromptBlock;
+          log.debug("subagent_spawning[inject-routing+skill]", {
             basePromptLen: basePrompt.length,
-            blockLen: routingInstructions.length,
+            hasRoutingInstructions: !!routingInstructions,
+            hasSkillLikeInstructions: !!skillLikeInstructions,
+            blockLen: injectedPromptBlock.length,
           });
           return { inputOverride: { ...(e.input ?? {}), prompt: newPrompt } };
         } catch {
@@ -722,29 +912,33 @@ export default {
 
     // ── 9. Context engine — Compaction management ──────────
 
-    api.registerContextEngine("context-mode", () => ({
-      info: {
-        id: "context-mode",
-        name: "Context Mode",
-        ownsCompaction: false,
-      },
+    if (api.registerContextEngine) {
+      api.registerContextEngine("context-mode", () => ({
+        info: {
+          id: "context-mode",
+          name: "Context Mode",
+          ownsCompaction: false,
+        },
 
-      async ingest() {
-        return { ingested: true };
-      },
+        async ingest() {
+          return { ingested: true };
+        },
 
-      async assemble({ messages }: { messages: unknown[] }) {
-        return { messages, estimatedTokens: 0 };
-      },
+        async assemble({ messages }: { messages: unknown[] }) {
+          return { messages, estimatedTokens: 0 };
+        },
 
-      async compact() {
-        // No-op: session continuity is handled by before_compaction / after_compaction hooks.
-        // Returning ownsCompaction: false + compacted: false lets the host platform (OpenClaw)
-        // manage conversation truncation, preserving Anthropic thinking/redacted_thinking blocks.
-        // See: https://github.com/mksglu/context-mode/issues/191
-        return { ok: true, compacted: false };
-      },
-    }));
+        async compact() {
+          // No-op: session continuity is handled by before_compaction / after_compaction hooks.
+          // Returning ownsCompaction: false + compacted: false lets the host platform (OpenClaw)
+          // manage conversation truncation, preserving Anthropic thinking/redacted_thinking blocks.
+          // See: https://github.com/mksglu/context-mode/issues/191
+          return { ok: true, compacted: false };
+        },
+      }));
+    } else {
+      log.warn?.("api.registerContextEngine unavailable — skipping context engine registration");
+    }
 
     // ── 10. Auto-reply commands — ctx slash commands ──────
     // Update module-level refs so command handlers (registered once) always
@@ -754,7 +948,7 @@ export default {
     _latestPluginRoot = pluginRoot;
 
     if (api.registerCommand) {
-      api.registerCommand({
+      registerAutoReplyCommand({
         name: "ctx-stats",
         description: "Show context-mode session statistics",
         handler: () => {
@@ -762,8 +956,7 @@ export default {
           return { text };
         },
       });
-
-      api.registerCommand({
+      registerAutoReplyCommand({
         name: "ctx-doctor",
         description: "Run context-mode diagnostics",
         handler: () => {
@@ -785,7 +978,7 @@ export default {
         },
       });
 
-      api.registerCommand({
+      registerAutoReplyCommand({
         name: "ctx-upgrade",
         description: "Upgrade context-mode to the latest version",
         handler: () => {

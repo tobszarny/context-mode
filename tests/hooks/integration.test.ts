@@ -92,21 +92,39 @@ function runHook(input: Record<string, unknown>, env?: Record<string, string>, {
   };
 }
 
-/** Assert hook redirects Bash command to an echo message via updatedInput */
-function assertRedirect(result: HookResult, substringInEcho: string) {
+/**
+ * Assert hook redirects Bash command via `permissionDecision: "deny"` + reason.
+ *
+ * CC v2.1.x Bash tool ignores `updatedInput.command` substitution under
+ * `permissionDecision: "allow"` — original command runs unchanged. Only
+ * `permissionDecision: "deny"` is honored for Bash blocking (verified via
+ * /diagnose Phase 4 forced-deny probe). The claude-code formatter now emits
+ * a deny shape for modify intent and surfaces the routing guidance via
+ * `permissionDecisionReason`.
+ */
+function assertRedirect(result: HookResult, substringInReason: string) {
   assert.equal(result.exitCode, 0, `Expected exit 0, got ${result.exitCode}`);
   assert.ok(result.stdout.length > 0, "Expected non-empty stdout for redirect");
   const parsed = JSON.parse(result.stdout);
   const hso = parsed.hookSpecificOutput;
   assert.ok(hso, "Expected hookSpecificOutput in response");
-  assert.ok(hso.updatedInput, "Expected updatedInput in hookSpecificOutput");
-  assert.ok(
-    hso.updatedInput.command.includes("echo"),
-    `Expected updatedInput.command to be an echo, got: ${hso.updatedInput.command}`,
+  assert.equal(
+    hso.permissionDecision,
+    "deny",
+    `Expected permissionDecision="deny" (CC Bash ignores updatedInput on allow), got: ${hso.permissionDecision}`,
   );
   assert.ok(
-    hso.updatedInput.command.includes(substringInEcho),
-    `Expected echo to contain "${substringInEcho}", got: ${hso.updatedInput.command}`,
+    typeof hso.permissionDecisionReason === "string" && hso.permissionDecisionReason.length > 0,
+    "Expected non-empty permissionDecisionReason",
+  );
+  assert.ok(
+    hso.permissionDecisionReason.includes(substringInReason),
+    `Expected reason to contain "${substringInReason}", got: ${hso.permissionDecisionReason}`,
+  );
+  assert.equal(
+    hso.updatedInput,
+    undefined,
+    "updatedInput MUST NOT appear alongside deny — CC ignores it for Bash",
   );
 }
 
@@ -240,9 +258,18 @@ describe("WebFetch", () => {
       parsed.hookSpecificOutput.permissionDecisionReason.includes("https://docs.example.com/api"),
       "Expected original URL in reason",
     );
+    // PR #683 follow-up (ADR-0003 amendment): the deny reason was reframed
+    // affirmatively. The negative "Do NOT retry with curl" hint was replaced
+    // by a positive imperative retry hint scoped to transient DNS errors and
+    // by the ctx_fetch_and_index call instruction. Assert on the affirmative
+    // wording instead of the dropped negation.
     assert.ok(
-      parsed.hookSpecificOutput.permissionDecisionReason.includes("Do NOT use curl"),
-      "Expected curl warning in reason",
+      /Retry the same call on a transient DNS error/.test(parsed.hookSpecificOutput.permissionDecisionReason),
+      "Expected positive transient-DNS retry hint in reason",
+    );
+    assert.ok(
+      /Call .*ctx_fetch_and_index/.test(parsed.hookSpecificOutput.permissionDecisionReason),
+      "Expected explicit ctx_fetch_and_index call instruction in reason",
     );
   });
 });
@@ -357,11 +384,19 @@ describe("initSecurity loud-failure (#466)", () => {
     const r = spawnSync("node", ["--input-type=module", "-e", code], {
       encoding: "utf-8",
       timeout: 10000,
-      env: { ...process.env, CONTEXT_MODE_SUPPRESS_SECURITY_WARNING: "" },
+      env: {
+        ...process.env,
+        CONTEXT_MODE_SUPPRESS_SECURITY_WARNING: "",
+        // #558 v1.0.127: initSecurity is now bundle-first. To exercise the
+        // "both missing → loud fail" contract, point the bundle test seam at
+        // a non-existent path so neither the bundle nor build/security.js
+        // can be loaded.
+        CONTEXT_MODE_SECURITY_BUNDLE_PATH: join(missingBuildDir, "no-bundle.mjs"),
+      },
     });
     assert.equal(r.status, 0, `subprocess failed: ${r.stderr}`);
     const parsed = JSON.parse(r.stdout);
-    assert.equal(parsed.ok, false, "initSecurity should return false when security.js missing");
+    assert.equal(parsed.ok, false, "initSecurity should return false when both bundle and security.js missing");
     assert.ok(
       r.stderr.includes("security deny patterns will NOT be enforced"),
       `expected loud warning on stderr, got: ${r.stderr}`,
@@ -378,7 +413,13 @@ describe("initSecurity loud-failure (#466)", () => {
     const r = spawnSync("node", ["--input-type=module", "-e", code], {
       encoding: "utf-8",
       timeout: 10000,
-      env: { ...process.env, CONTEXT_MODE_SUPPRESS_SECURITY_WARNING: "1" },
+      env: {
+        ...process.env,
+        CONTEXT_MODE_SUPPRESS_SECURITY_WARNING: "1",
+        // #558 v1.0.127: bundle-first — hide the bundle so the warn-or-suppress
+        // codepath actually runs (otherwise bundle loads and warning never fires).
+        CONTEXT_MODE_SECURITY_BUNDLE_PATH: join(missingBuildDir, "no-bundle.mjs"),
+      },
     });
     assert.equal(r.status, 0);
     assert.ok(
@@ -476,6 +517,28 @@ describe("Security Policy Enforcement", () => {
     assert.equal(result.stdout, "", "Non-shell language should passthrough");
   });
 
+  test("MCP execute + shell pins cwd from hook input over stale CLAUDE_PROJECT_DIR (#756)", () => {
+    const mainRepo = mkdtempSync(join(tmpdir(), "ctx-756-main-"));
+    const worktree = mkdtempSync(join(tmpdir(), "ctx-756-worktree-"));
+    try {
+      const result = runHook(
+        {
+          cwd: worktree,
+          tool_name: "mcp__plugin_context-mode_context-mode__ctx_execute",
+          tool_input: { language: "shell", code: "pwd" },
+        },
+        { ...secEnv, CLAUDE_PROJECT_DIR: mainRepo },
+      );
+      assert.equal(result.exitCode, 0);
+      const parsed = JSON.parse(result.stdout);
+      assert.equal(parsed.hookSpecificOutput.updatedInput.cwd, worktree);
+      assert.equal(parsed.hookSpecificOutput.updatedInput.code, "pwd");
+    } finally {
+      rmSyncRobust(mainRepo);
+      rmSyncRobust(worktree);
+    }
+  });
+
   test("Security: MCP execute_file + .env path denied", () => {
     const result = runHook(
       {
@@ -533,21 +596,28 @@ describe("Security Policy Enforcement", () => {
     assert.equal(parsed.hookSpecificOutput.permissionDecision, "deny");
   });
 
-  test("Security: MCP batch_execute with all allowed commands passthrough", () => {
-    const result = runHook(
-      {
-        tool_name: "mcp__plugin_context-mode_context-mode__ctx_batch_execute",
-        tool_input: {
-          commands: [
-            { label: "list", command: "ls -la" },
-            { label: "git", command: "git log --oneline -5" },
-          ],
+  test("MCP batch_execute with allowed commands pins cwd from hook input (#756)", () => {
+    const worktree = mkdtempSync(join(tmpdir(), "ctx-756-batch-worktree-"));
+    try {
+      const result = runHook(
+        {
+          cwd: worktree,
+          tool_name: "mcp__plugin_context-mode_context-mode__ctx_batch_execute",
+          tool_input: {
+            commands: [
+              { label: "list", command: "ls -la" },
+              { label: "git", command: "git log --oneline -5" },
+            ],
+          },
         },
-      },
-      secEnv,
-    );
-    assert.equal(result.exitCode, 0);
-    assert.equal(result.stdout, "", "All allowed commands should passthrough");
+        secEnv,
+      );
+      assert.equal(result.exitCode, 0);
+      const parsed = JSON.parse(result.stdout);
+      assert.equal(parsed.hookSpecificOutput.updatedInput.cwd, worktree);
+    } finally {
+      rmSyncRobust(worktree);
+    }
   });
 });
 
@@ -599,14 +669,18 @@ describe("Plugin Tool Name Format in ROUTING_BLOCK", () => {
     assert.ok(!reason.includes(SHORT_PREFIX + "ctx_fetch_and_index"), "WebFetch deny must not contain short-form");
   });
 
-  test("Bash inline-HTTP redirect uses plugin-format execute tool name", () => {
+  test("Bash inline-HTTP redirect uses plugin-format execute tool name (in deny reason)", () => {
+    // CC v2.1.x Bash tool ignores updatedInput.command — the formatter now
+    // emits deny + permissionDecisionReason. The plugin-format tool name
+    // assertion moves from updatedInput.command to permissionDecisionReason.
     const bashCmd = "python3 -c 'import requests; requests.get(url)'";
     const result = runHook({ tool_name: "Bash", tool_input: { command: bashCmd } });
     assert.equal(result.exitCode, 0);
     const parsed = JSON.parse(result.stdout);
-    const cmd = parsed.hookSpecificOutput.updatedInput.command;
-    assert.ok(cmd.includes(PLUGIN_PREFIX + "ctx_execute"), "Expected plugin-format ctx_execute in inline-HTTP redirect");
-    assert.ok(!cmd.includes(SHORT_PREFIX + "ctx_execute"), "Inline-HTTP redirect must not contain short-form ctx_execute");
+    const reason = parsed.hookSpecificOutput.permissionDecisionReason;
+    assert.ok(typeof reason === "string" && reason.length > 0, "Expected non-empty permissionDecisionReason");
+    assert.ok(reason.includes(PLUGIN_PREFIX + "ctx_execute"), "Expected plugin-format ctx_execute in inline-HTTP redirect reason");
+    assert.ok(!reason.includes(SHORT_PREFIX + "ctx_execute"), "Inline-HTTP redirect must not contain short-form ctx_execute");
   });
 });
 
@@ -1134,4 +1208,109 @@ describe("buildAutoInjection", () => {
     // overflow to 3. Total should stay near or under budget.
     expect(tokens).toBeLessThanOrEqual(600); // allow small overshoot from structural XML
   });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// Issue #636 — PreToolUse hook fails on project paths containing spaces.
+//
+// The self-heal "legacy" branch in pretooluse.mjs (only fires when the
+// plugin cache lives at a stale-version dir AND hooks.json is absent —
+// typical for users who upgraded from <v1.0.108) used to write hook
+// commands as the unquoted string `node ${path}`. When the plugin cache
+// path contained spaces (Dropbox/iCloud display names, CLAUDE_CONFIG_DIR
+// pointed at a synced folder), the resulting settings.json had a command
+// like `node /Users/foo/Library/CloudStorage/Lucas Werneck/.../pretooluse.mjs`
+// that /bin/sh word-split into pieces, producing the user-visible
+// "Failed with non-blocking status code" spam on every tool call.
+//
+// Regression guard: the rewritten command must round-trip through
+// /bin/sh -c without parse errors. Properly quoting the script path
+// (via JSON.stringify) is sufficient.
+// ═══════════════════════════════════════════════════════════════════════
+
+describe("Issue #636: legacy settings.json rewrite quotes spaced paths", () => {
+  // Skip on Windows — the legacy rewrite + /bin/sh assertion are POSIX-only.
+  // Windows users go through normalize-hooks.mjs (#378/#582) which is already
+  // covered by tests/hooks/windows-hooks-normalization.test.ts.
+  const skipOnWindows = process.platform === "win32";
+
+  // The legacy rewrite at hooks/pretooluse.mjs:124-135 is a self-contained
+  // string mutation. We replicate it here verbatim against the FIXED code so
+  // the regression is locked in even if future contributors restructure the
+  // block. The test deliberately uses a *spaced* targetDir to mirror the
+  // user-reported Dropbox/iCloud scenario from #636.
+  function applyLegacyRewrite(command: string, targetDir: string): string | null {
+    if (
+      command &&
+      command.includes(".mjs") &&
+      command.includes("context-mode") &&
+      !command.includes(targetDir)
+    ) {
+      const scriptMatch = command.match(/([a-z]+\.mjs)\s*"?\s*$/);
+      if (scriptMatch) {
+        const scriptPath = resolve(targetDir, "hooks", scriptMatch[1]);
+        // MUST match the production form in hooks/pretooluse.mjs (#636 fix):
+        // path is JSON.stringify'd so spaces inside targetDir survive
+        // /bin/sh word-splitting at hook-spawn time.
+        return `node ${JSON.stringify(scriptPath)}`;
+      }
+    }
+    return null;
+  }
+
+  test.skipIf(skipOnWindows)(
+    "rewritten command keeps spaced path quoted so /bin/sh sees one arg",
+    () => {
+      const spacedTargetDir =
+        "/Users/foo/Library/CloudStorage/Dropbox-2olhares/Lucas Werneck/.claude/plugins/cache/context-mode/context-mode/1.0.140";
+      const staleCommand =
+        "node /old/path/context-mode/0.5.0/hooks/pretooluse.mjs";
+
+      const rewritten = applyLegacyRewrite(staleCommand, spacedTargetDir);
+      expect(rewritten).not.toBeNull();
+      expect(rewritten).toContain("Lucas Werneck");
+      expect(rewritten).toContain("/hooks/pretooluse.mjs");
+
+      // CORE ASSERTION (#636): /bin/sh -c "<cmd>" must parse the path as
+      // a single positional arg, not split on whitespace. Use `printf %s\n`
+      // to enumerate the post-split argv — the OLD unquoted form yielded
+      // 4 tokens (node, /Users/foo/.../Lucas, Werneck/..., pretooluse.mjs);
+      // the FIXED form yields exactly 2 (node + quoted script path).
+      const probe = spawnSync(
+        "/bin/sh",
+        ["-c", `set -- ${rewritten}; printf "%s\\n" "$#" "$@"`],
+        { encoding: "utf-8", timeout: 5_000 },
+      );
+      expect(probe.status).toBe(0);
+      const lines = probe.stdout.trim().split("\n");
+      expect(lines[0]).toBe("2"); // exactly: node + script
+      expect(lines[1]).toBe("node");
+      expect(lines[2]).toBe(
+        resolve(spacedTargetDir, "hooks", "pretooluse.mjs"),
+      );
+    },
+  );
+
+  test.skipIf(skipOnWindows)(
+    "without the fix, /bin/sh would word-split the spaced path (red baseline)",
+    () => {
+      // Encode the OLD buggy form so we have a fail-loud regression baseline.
+      // This documents what the bug looked like — if anyone ever reverts the
+      // fix, the assertion above flips and this one stays as the diagnostic.
+      const spacedTargetDir =
+        "/Users/foo/Library/CloudStorage/Lucas Werneck/.claude/plugins/cache/context-mode/context-mode/1.0.140";
+      const buggyForm =
+        "node " + resolve(spacedTargetDir, "hooks", "pretooluse.mjs");
+      const probe = spawnSync(
+        "/bin/sh",
+        ["-c", `set -- ${buggyForm}; printf "%s\\n" "$#"`],
+        { encoding: "utf-8", timeout: 5_000 },
+      );
+      expect(probe.status).toBe(0);
+      // Spaced path word-splits into multiple tokens — exactly the
+      // pathological state the #636 fix prevents.
+      const tokenCount = Number(probe.stdout.trim().split("\n")[0]);
+      expect(tokenCount).toBeGreaterThan(2);
+    },
+  );
 });

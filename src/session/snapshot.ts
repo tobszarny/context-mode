@@ -402,6 +402,62 @@ function buildIntentSection(intentEvents: StoredEvent[]): string {
   return `  <intent mode="${escapeXML(lastIntent.data)}"/>`;
 }
 
+/**
+ * Restore the most recent stated session goal verbatim. Placed at the top of
+ * the snapshot (right after how_to_search) so the resuming LLM reads the
+ * active objective before anything else and keeps working toward it.
+ */
+function buildGoalSection(goalEvents: StoredEvent[]): string {
+  if (goalEvents.length === 0) return "";
+  const lastGoal = goalEvents[goalEvents.length - 1];
+  return [
+    `  <session_goal>`,
+    `  The active objective for this session. Keep working toward it until it is met; do not ask the user to restate it.`,
+    `    ${escapeXML(lastGoal.data)}`,
+    `  </session_goal>`,
+  ].join("\n");
+}
+
+/**
+ * Raw-prompt safety net (issue #535):
+ * Always surface the most recent user prompts verbatim so the next LLM
+ * sees them even if every universal-rule detector misses. Bound per-prompt
+ * payload to RECENT_MESSAGE_MAX_CHARS Unicode codepoints; bound the total
+ * count to RECENT_MESSAGES_LIMIT to keep the resume block compact.
+ */
+const RECENT_MESSAGES_LIMIT = 3;
+const RECENT_MESSAGE_MAX_CHARS = 400;
+
+function truncateForSnapshot(value: string, max: number): string {
+  const codepoints = [...value];
+  if (codepoints.length <= max) return value;
+  return codepoints.slice(0, max).join("");
+}
+
+function buildRecentMessagesSection(userPromptEvents: StoredEvent[]): string {
+  if (userPromptEvents.length === 0) return "";
+
+  // Last N in chronological order — newest at the bottom mirrors the
+  // way the user reads their own scrollback.
+  const recent = userPromptEvents.slice(-RECENT_MESSAGES_LIMIT);
+
+  const items = recent
+    .map(ev => {
+      const body = truncateForSnapshot(ev.data ?? "", RECENT_MESSAGE_MAX_CHARS);
+      if (!body) return "";
+      return `    <message>${escapeXML(body)}</message>`;
+    })
+    .filter(Boolean);
+
+  if (items.length === 0) return "";
+
+  return [
+    `  <recent_user_messages count="${items.length}">`,
+    ...items,
+    `  </recent_user_messages>`,
+  ].join("\n");
+}
+
 // ── Main builder ─────────────────────────────────────────────────────────────
 
 /**
@@ -432,8 +488,10 @@ export function buildResumeSnapshot(
   const gitEvents: StoredEvent[] = [];
   const subagentEvents: StoredEvent[] = [];
   const intentEvents: StoredEvent[] = [];
+  const goalEvents: StoredEvent[] = [];
   const skillEvents: StoredEvent[] = [];
   const roleEvents: StoredEvent[] = [];
+  const userPromptEvents: StoredEvent[] = [];
 
   for (const ev of events) {
     switch (ev.category) {
@@ -447,8 +505,10 @@ export function buildResumeSnapshot(
       case "git": gitEvents.push(ev); break;
       case "subagent": subagentEvents.push(ev); break;
       case "intent": intentEvents.push(ev); break;
+      case "goal": goalEvents.push(ev); break;
       case "skill": skillEvents.push(ev); break;
       case "role": roleEvents.push(ev); break;
+      case "user-prompt": userPromptEvents.push(ev); break;
     }
   }
 
@@ -462,6 +522,10 @@ export function buildResumeSnapshot(
   Do NOT ask the user to re-explain prior work. Search first.
   Do NOT invent your own queries — use the ones provided.
   </how_to_search>`);
+
+  // Session goal first — the objective the LLM must keep working toward.
+  const goal = buildGoalSection(goalEvents);
+  if (goal) sections.push(goal);
 
   const files = buildFilesSection(fileEvents, searchTool);
   if (files) sections.push(files);
@@ -495,6 +559,11 @@ export function buildResumeSnapshot(
 
   const intent = buildIntentSection(intentEvents);
   if (intent) sections.push(intent);
+
+  // Raw-prompt safety net — always last so it stays adjacent to the next
+  // LLM turn and is read after the structured sections.
+  const recentMessages = buildRecentMessagesSection(userPromptEvents);
+  if (recentMessages) sections.push(recentMessages);
 
   // ── Assemble ──
   const header = `<session_resume events="${events.length}" compact_count="${compactCount}" generated_at="${now}">`;

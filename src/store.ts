@@ -15,6 +15,7 @@ import { readFileSync, readdirSync, unlinkSync, existsSync, statSync, openSync, 
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { walkDirectoryDetailed, type WalkOptions } from "./store-directory.js";
 
 // ─────────────────────────────────────────────────────────
 // Types
@@ -36,6 +37,8 @@ type SearchRow = {
   label: string;
   rank: number;
   highlighted: string;
+  /** Attribution session_id (empty string for legacy unattributed chunks). */
+  session_id: string;
 };
 
 import type { IndexResult, SearchResult, StoreStats } from "./types.js";
@@ -148,6 +151,23 @@ function maxEditDistance(wordLength: number): number {
 // length normalization and produce unwieldy search results. Split at paragraph
 // boundaries when a chunk exceeds this cap.
 const MAX_CHUNK_BYTES = 4096;
+
+// Blank-line sectioning is used only for output that is *naturally* sectioned:
+// at least a few sections, not an unbounded explosion, and no single section so
+// large that the split is clearly not the real structure (those fall back to
+// line-grouping). Sections that pass the heuristic but still exceed
+// MAX_CHUNK_BYTES are sub-split so no persisted chunk breaks the cap.
+const MIN_BLANK_LINE_SECTIONS = 3;
+const MAX_BLANK_LINE_SECTIONS = 200;
+const BLANK_SECTION_STRATEGY_MAX_BYTES = 5000;
+
+// Number of leading characters of a chunk's first line used as its title.
+const CHUNK_TITLE_MAX_CHARS = 80;
+
+// When byte-splitting an oversized single line, prefer to break at a whitespace
+// boundary for readability — but only if that boundary is past this fraction of
+// the slice, otherwise we'd waste too much of the byte budget.
+const WHITESPACE_BREAK_RATIO = 0.5;
 
 // ─────────────────────────────────────────────────────────
 // ContentStore
@@ -298,7 +318,7 @@ function findMinSpan(positionLists: number[][]): number {
   if (positionLists.length === 0) return Infinity;
   if (positionLists.length === 1) return 0;
 
-  const sorted = positionLists.map((p) => [...p].sort((a, b) => a - b));
+  const sorted = positionLists;
   const ptrs = new Array(sorted.length).fill(0);
   let minSpan = Infinity;
 
@@ -570,7 +590,8 @@ export class ContentStore {
         chunks.timestamp,
         sources.label,
         bm25(chunks, 5.0, 1.0) AS rank,
-        highlight(chunks, 1, char(2), char(3)) AS highlighted
+        highlight(chunks, 1, char(2), char(3)) AS highlighted,
+        chunks.session_id
       FROM chunks
       JOIN sources ON sources.id = chunks.source_id
       WHERE chunks MATCH ?
@@ -585,10 +606,11 @@ export class ContentStore {
         chunks.timestamp,
         sources.label,
         bm25(chunks, 5.0, 1.0) AS rank,
-        highlight(chunks, 1, char(2), char(3)) AS highlighted
+        highlight(chunks, 1, char(2), char(3)) AS highlighted,
+        chunks.session_id
       FROM chunks
       JOIN sources ON sources.id = chunks.source_id
-      WHERE chunks MATCH ? AND sources.label LIKE ?
+      WHERE chunks MATCH ? AND sources.label LIKE ? ESCAPE '\\'
       ORDER BY rank
       LIMIT ?
     `);
@@ -600,7 +622,8 @@ export class ContentStore {
         chunks.timestamp,
         sources.label,
         bm25(chunks, 5.0, 1.0) AS rank,
-        highlight(chunks, 1, char(2), char(3)) AS highlighted
+        highlight(chunks, 1, char(2), char(3)) AS highlighted,
+        chunks.session_id
       FROM chunks
       JOIN sources ON sources.id = chunks.source_id
       WHERE chunks MATCH ? AND sources.label = ?
@@ -615,7 +638,8 @@ export class ContentStore {
         chunks_trigram.timestamp,
         sources.label,
         bm25(chunks_trigram, 5.0, 1.0) AS rank,
-        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted
+        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted,
+        chunks_trigram.session_id
       FROM chunks_trigram
       JOIN sources ON sources.id = chunks_trigram.source_id
       WHERE chunks_trigram MATCH ?
@@ -630,10 +654,11 @@ export class ContentStore {
         chunks_trigram.timestamp,
         sources.label,
         bm25(chunks_trigram, 5.0, 1.0) AS rank,
-        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted
+        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted,
+        chunks_trigram.session_id
       FROM chunks_trigram
       JOIN sources ON sources.id = chunks_trigram.source_id
-      WHERE chunks_trigram MATCH ? AND sources.label LIKE ?
+      WHERE chunks_trigram MATCH ? AND sources.label LIKE ? ESCAPE '\\'
       ORDER BY rank
       LIMIT ?
     `);
@@ -645,7 +670,8 @@ export class ContentStore {
         chunks_trigram.timestamp,
         sources.label,
         bm25(chunks_trigram, 5.0, 1.0) AS rank,
-        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted
+        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted,
+        chunks_trigram.session_id
       FROM chunks_trigram
       JOIN sources ON sources.id = chunks_trigram.source_id
       WHERE chunks_trigram MATCH ? AND sources.label = ?
@@ -662,7 +688,8 @@ export class ContentStore {
         chunks.timestamp,
         sources.label,
         bm25(chunks, 5.0, 1.0) AS rank,
-        highlight(chunks, 1, char(2), char(3)) AS highlighted
+        highlight(chunks, 1, char(2), char(3)) AS highlighted,
+        chunks.session_id
       FROM chunks
       JOIN sources ON sources.id = chunks.source_id
       WHERE chunks MATCH ? AND chunks.content_type = ?
@@ -677,10 +704,11 @@ export class ContentStore {
         chunks.timestamp,
         sources.label,
         bm25(chunks, 5.0, 1.0) AS rank,
-        highlight(chunks, 1, char(2), char(3)) AS highlighted
+        highlight(chunks, 1, char(2), char(3)) AS highlighted,
+        chunks.session_id
       FROM chunks
       JOIN sources ON sources.id = chunks.source_id
-      WHERE chunks MATCH ? AND sources.label LIKE ? AND chunks.content_type = ?
+      WHERE chunks MATCH ? AND sources.label LIKE ? ESCAPE '\\' AND chunks.content_type = ?
       ORDER BY rank
       LIMIT ?
     `);
@@ -692,7 +720,8 @@ export class ContentStore {
         chunks.timestamp,
         sources.label,
         bm25(chunks, 5.0, 1.0) AS rank,
-        highlight(chunks, 1, char(2), char(3)) AS highlighted
+        highlight(chunks, 1, char(2), char(3)) AS highlighted,
+        chunks.session_id
       FROM chunks
       JOIN sources ON sources.id = chunks.source_id
       WHERE chunks MATCH ? AND sources.label = ? AND chunks.content_type = ?
@@ -707,7 +736,8 @@ export class ContentStore {
         chunks_trigram.timestamp,
         sources.label,
         bm25(chunks_trigram, 5.0, 1.0) AS rank,
-        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted
+        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted,
+        chunks_trigram.session_id
       FROM chunks_trigram
       JOIN sources ON sources.id = chunks_trigram.source_id
       WHERE chunks_trigram MATCH ? AND chunks_trigram.content_type = ?
@@ -722,10 +752,11 @@ export class ContentStore {
         chunks_trigram.timestamp,
         sources.label,
         bm25(chunks_trigram, 5.0, 1.0) AS rank,
-        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted
+        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted,
+        chunks_trigram.session_id
       FROM chunks_trigram
       JOIN sources ON sources.id = chunks_trigram.source_id
-      WHERE chunks_trigram MATCH ? AND sources.label LIKE ? AND chunks_trigram.content_type = ?
+      WHERE chunks_trigram MATCH ? AND sources.label LIKE ? ESCAPE '\\' AND chunks_trigram.content_type = ?
       ORDER BY rank
       LIMIT ?
     `);
@@ -737,7 +768,8 @@ export class ContentStore {
         chunks_trigram.timestamp,
         sources.label,
         bm25(chunks_trigram, 5.0, 1.0) AS rank,
-        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted
+        highlight(chunks_trigram, 1, char(2), char(3)) AS highlighted,
+        chunks_trigram.session_id
       FROM chunks_trigram
       JOIN sources ON sources.id = chunks_trigram.source_id
       WHERE chunks_trigram MATCH ? AND sources.label = ? AND chunks_trigram.content_type = ?
@@ -807,8 +839,14 @@ export class ContentStore {
     content?: string;
     path?: string;
     source?: string;
+    /**
+     * Optional FK metadata recorded on each indexed chunk so per-session
+     * honest-savings stats can join chunks → session_events. When omitted,
+     * chunks fall back to empty-string columns (legacy behaviour).
+     */
+    attribution?: { sessionId?: string; eventId?: string };
   }): IndexResult {
-    const { content, path, source } = options;
+    const { content, path, source, attribution } = options;
 
     // Treat empty string as "no content" so an empty `content` paired with a
     // valid `path` falls back to reading the file. Some MCP clients
@@ -851,7 +889,71 @@ export class ContentStore {
     const filePath = path ?? undefined;
     const contentHash = filePath ? createHash("sha256").update(text).digest("hex") : undefined;
 
-    return withRetry(() => this.#insertChunks(chunks, label, text, filePath, contentHash));
+    return withRetry(() => this.#insertChunks(chunks, label, text, filePath, contentHash, attribution));
+  }
+
+  // ── Index Directory (#687) ──
+
+  /**
+   * Index every file under a directory by walking it with `walkDirectory` and
+   * delegating each discovered file to `this.index({ path })`. The per-file
+   * `openSync + fstatSync.isFile()` security gate at line ~845 stays active
+   * for every file — directory support never bypasses the TOCTOU defense
+   * from #442 round-3.
+   *
+   * Reported by @matiasduartee in #687.
+   */
+  indexDirectory(opts: {
+    path: string;
+    source?: string;
+    attribution?: { sessionId?: string; eventId?: string };
+    /** Optional per-file deny check — runs INSIDE the walk loop so a denied
+     *  file does not even open a fd. Returns true to deny. */
+    perFileDeny?: (absPath: string) => boolean;
+  } & WalkOptions): {
+    filesIndexed: number;
+    totalChunks: number;
+    capped: boolean;
+    totalSeen: number;
+    denied: number;
+    failed: number;
+    label: string;
+  } {
+    const { path: rootPath, source, attribution, perFileDeny, ...walkOpts } = opts;
+    const walked = walkDirectoryDetailed(rootPath, walkOpts);
+
+    let filesIndexed = 0;
+    let totalChunks = 0;
+    let denied = 0;
+    let failed = 0;
+
+    for (const file of walked.files) {
+      if (perFileDeny && perFileDeny(file)) {
+        denied++;
+        continue;
+      }
+      try {
+        // Per-file source label so ctx_search(source: "<file>") still works.
+        const fileSource = source ? `${source}:${file}` : file;
+        const r = this.index({ path: file, source: fileSource, attribution });
+        filesIndexed++;
+        totalChunks += r.totalChunks;
+      } catch {
+        // Per-file failure (e.g. fd-bound fstat rejection of a non-regular
+        // file that races between walk and read) — count + continue.
+        failed++;
+      }
+    }
+
+    return {
+      filesIndexed,
+      totalChunks,
+      capped: walked.capped,
+      totalSeen: walked.totalSeen,
+      denied,
+      failed,
+      label: source ?? rootPath,
+    };
   }
 
   // ── Index Plain Text ──
@@ -865,17 +967,22 @@ export class ContentStore {
     content: string,
     source: string,
     linesPerChunk: number = 20,
+    attribution?: { sessionId?: string; eventId?: string },
+    maxChunkBytes: number = MAX_CHUNK_BYTES,
   ): IndexResult {
     if (!content || content.trim().length === 0) {
-      return this.#insertChunks([], source, "");
+      return this.#insertChunks([], source, "", undefined, undefined, attribution);
     }
 
-    const chunks = this.#chunkPlainText(content, linesPerChunk);
+    const chunks = this.#chunkPlainText(content, linesPerChunk, maxChunkBytes);
 
     return withRetry(() => this.#insertChunks(
       chunks.map((c) => ({ ...c, hasCode: false })),
       source,
       content,
+      undefined,
+      undefined,
+      attribution,
     ));
   }
 
@@ -892,26 +999,27 @@ export class ContentStore {
     content: string,
     source: string,
     maxChunkBytes: number = MAX_CHUNK_BYTES,
+    attribution?: { sessionId?: string; eventId?: string },
   ): IndexResult {
     if (!content || content.trim().length === 0) {
-      return this.indexPlainText("", source);
+      return this.indexPlainText("", source, undefined, attribution, maxChunkBytes);
     }
 
     let parsed: unknown;
     try {
       parsed = JSON.parse(content);
     } catch {
-      return this.indexPlainText(content, source);
+      return this.indexPlainText(content, source, undefined, attribution, maxChunkBytes);
     }
 
     const chunks: Chunk[] = [];
     this.#walkJSON(parsed, [], chunks, maxChunkBytes);
 
     if (chunks.length === 0) {
-      return this.indexPlainText(content, source);
+      return this.indexPlainText(content, source, undefined, attribution, maxChunkBytes);
     }
 
-    return withRetry(() => this.#insertChunks(chunks, source, content));
+    return withRetry(() => this.#insertChunks(chunks, source, content, undefined, undefined, attribution));
   }
 
   // ── Shared DB Insertion ──
@@ -921,8 +1029,19 @@ export class ContentStore {
    * into both FTS5 tables within a transaction and extracts vocabulary.
    * Uses cached prepared statements from #prepareStatements().
    */
-  #insertChunks(chunks: Chunk[], label: string, text: string, filePath?: string, contentHash?: string): IndexResult {
+  #insertChunks(
+    chunks: Chunk[],
+    label: string,
+    text: string,
+    filePath?: string,
+    contentHash?: string,
+    attribution?: { sessionId?: string; eventId?: string },
+  ): IndexResult {
     const codeChunks = chunks.filter((c) => c.hasCode).length;
+    // FK columns on chunks. Empty-string fallback preserves the FTS5-friendly
+    // "not-null but unattributed" sentinel used by legacy rows.
+    const sessionIdCol = attribution?.sessionId ?? "";
+    const eventIdCol = attribution?.eventId ?? "";
 
     // Atomic dedup + insert: delete previous source with same label,
     // then insert new content — all within a single transaction.
@@ -943,8 +1062,8 @@ export class ContentStore {
       const now = new Date().toISOString();
       for (const chunk of chunks) {
         const ct = chunk.hasCode ? "code" : "prose";
-        this.#stmtInsertChunk.run(chunk.title, chunk.content, sourceId, ct, null, null, null, now);
-        this.#stmtInsertChunkTrigram.run(chunk.title, chunk.content, sourceId, ct, null, null, null, now);
+        this.#stmtInsertChunk.run(chunk.title, chunk.content, sourceId, ct, null, sessionIdCol, eventIdCol, now);
+        this.#stmtInsertChunkTrigram.run(chunk.title, chunk.content, sourceId, ct, null, sessionIdCol, eventIdCol, now);
       }
 
       return sourceId;
@@ -981,11 +1100,23 @@ export class ContentStore {
       contentType: r.content_type as "code" | "prose",
       highlighted: r.highlighted,
       timestamp: r.timestamp ?? undefined,
+      sessionId: r.session_id ?? "",
     }));
   }
 
   #sourceFilterParam(source: string, sourceMatchMode: SourceMatchMode): string {
-    return sourceMatchMode === "exact" ? source : `%${source}%`;
+    if (sourceMatchMode === "exact") return source;
+    // Escape SQLite LIKE metacharacters so user-supplied source labels
+    // containing `_`, `%`, or `\` are matched literally rather than as
+    // wildcards. Backslash must be replaced first (otherwise subsequent
+    // escapes would themselves be re-escaped). Paired with `ESCAPE '\'`
+    // in the four prepared LIKE statements (#stmtSearchPorter*,
+    // #stmtSearchTrigram*). Regression: #646.
+    const escaped = source
+      .replace(/\\/g, "\\\\")
+      .replace(/%/g, "\\%")
+      .replace(/_/g, "\\_");
+    return `%${escaped}%`;
   }
 
   search(
@@ -1212,14 +1343,24 @@ export class ContentStore {
     source?: string,
     contentType?: "code" | "prose",
     sourceMatchMode: SourceMatchMode = "like",
+    sessionIdAllowSet?: Set<string>,
   ): SearchResult[] {
     // Step 0: Auto-refresh stale file-backed sources before searching
     this.#refreshStaleSources();
 
+    // When a session-id allow-set is in play (issue #737 project filter),
+    // fetch a larger candidate pool from the FTS5 layers so the post-filter
+    // can still deliver `limit` matches even if many candidates are excluded.
+    // The cap is bounded — even at the largest installs the chunk count
+    // dwarfs `limit * 8`, and the surplus is dropped on the post-filter.
+    const fetchLimit = sessionIdAllowSet ? Math.max(limit * 8, 40) : limit;
+    const sessionFilter = this.#makeSessionFilter(sessionIdAllowSet);
+
     // Step 1: RRF fusion (porter OR + trigram OR → merge)
-    const rrfResults = this.#rrfSearch(query, limit, source, contentType, sourceMatchMode);
-    if (rrfResults.length > 0) {
-      const reranked = this.#applyProximityReranking(rrfResults, query);
+    const rrfResults = this.#rrfSearch(query, fetchLimit, source, contentType, sourceMatchMode);
+    const rrfFiltered = sessionFilter ? rrfResults.filter(sessionFilter) : rrfResults;
+    if (rrfFiltered.length > 0) {
+      const reranked = this.#applyProximityReranking(rrfFiltered.slice(0, limit), query);
       return reranked.map((r) => ({ ...r, matchLayer: "rrf" as const }));
     }
 
@@ -1236,14 +1377,31 @@ export class ContentStore {
     const correctedQuery = correctedWords.join(" ");
 
     if (correctedQuery !== original) {
-      const fuzzyResults = this.#rrfSearch(correctedQuery, limit, source, contentType, sourceMatchMode);
-      if (fuzzyResults.length > 0) {
-        const reranked = this.#applyProximityReranking(fuzzyResults, correctedQuery);
+      const fuzzyResults = this.#rrfSearch(correctedQuery, fetchLimit, source, contentType, sourceMatchMode);
+      const fuzzyFiltered = sessionFilter ? fuzzyResults.filter(sessionFilter) : fuzzyResults;
+      if (fuzzyFiltered.length > 0) {
+        const reranked = this.#applyProximityReranking(fuzzyFiltered.slice(0, limit), correctedQuery);
         return reranked.map((r) => ({ ...r, matchLayer: "rrf-fuzzy" as const }));
       }
     }
 
     return [];
+  }
+
+  /**
+   * Build the session-id post-filter for the FTS5 candidate pool. Legacy
+   * chunks indexed before per-session attribution carry `session_id=''` and
+   * stay visible across projects so user-indexed content remains reachable
+   * after opting into the shared-DB mode (#737).
+   */
+  #makeSessionFilter(
+    allowSet: Set<string> | undefined,
+  ): ((r: SearchResult) => boolean) | null {
+    if (!allowSet) return null;
+    return (r: SearchResult) => {
+      const sid = r.sessionId ?? "";
+      return sid === "" || allowSet.has(sid);
+    };
   }
 
   /** Number of sources auto-refreshed in the last searchWithFallback call. */
@@ -1313,6 +1471,27 @@ export class ContentStore {
       label: string;
       chunkCount: number;
     }>;
+  }
+
+  /**
+   * Aggregate snapshot of the persistent content store. Returns total
+   * chunk count, source count, and the most recent indexed_at timestamp.
+   * Used by ctx_stats so callers can see observability state in the same
+   * round trip instead of inferring it from snapshot diffs.
+   */
+  getIndexState(): { totalChunks: number; totalSources: number; lastIndexedAt?: string } {
+    const row = (this.#db
+      .prepare("SELECT COALESCE(SUM(chunk_count), 0) AS total_chunks, COUNT(*) AS total_sources, MAX(indexed_at) AS last_indexed_at FROM sources")
+      .get() as {
+        total_chunks: number;
+        total_sources: number;
+        last_indexed_at: string | null;
+      });
+    return {
+      totalChunks: row.total_chunks ?? 0,
+      totalSources: row.total_sources ?? 0,
+      lastIndexedAt: row.last_indexed_at ?? undefined,
+    };
   }
 
   /**
@@ -1583,34 +1762,132 @@ export class ContentStore {
     return chunks;
   }
 
+  /**
+   * Return the largest prefix of `str` whose UTF-8 byte length does not exceed
+   * `maxBytes`, walking by Unicode code point so multibyte sequences (CJK) and
+   * surrogate pairs (emoji) are never cut mid-character. Guarantees forward
+   * progress: if even the first code point exceeds `maxBytes`, it is still
+   * returned whole (a 1-4 byte overshoot beats an infinite loop).
+   */
+  #byteCappedPrefix(str: string, maxBytes: number): string {
+    if (Buffer.byteLength(str) <= maxBytes) return str;
+    let prefix = "";
+    let bytes = 0;
+    for (const char of str) {
+      const charBytes = Buffer.byteLength(char);
+      if (bytes + charBytes > maxBytes) break;
+      prefix += char;
+      bytes += charBytes;
+    }
+    // Defensive: a single code point wider than the cap (only possible with a
+    // pathologically small maxBytes) still advances by one character.
+    if (prefix.length === 0) return [...str][0] ?? "";
+    return prefix;
+  }
+
+  /**
+   * Split a single oversized plain-text chunk into byte-capped sub-chunks
+   * by accumulating lines until the byte count would exceed maxChunkBytes.
+   * Falls back to byte-accurate splitting for extremely long single lines.
+   */
+  #splitOversizedPlainChunk(
+    lines: string[],
+    titlePrefix: string,
+    maxChunkBytes: number,
+  ): Array<{ title: string; content: string }> {
+    const subChunks: Array<{ title: string; content: string }> = [];
+    let accumulator: string[] = [];
+    let partIndex = 1;
+
+    const flushAccumulator = () => {
+      if (accumulator.length === 0) return;
+      const content = accumulator.join("\n");
+      const partTitle = partIndex === 1 ? titlePrefix : `${titlePrefix} (${partIndex})`;
+      subChunks.push({ title: partTitle, content });
+      partIndex++;
+      accumulator = [];
+    };
+
+    for (const line of lines) {
+      // If a single line itself exceeds the cap (even as first line),
+      // split it by character before accumulating
+      if (Buffer.byteLength(line) > maxChunkBytes) {
+        flushAccumulator();
+        // Split the long line into byte-capped pieces
+        let remaining = line;
+        let linePart = 1;
+        while (remaining.length > 0) {
+          // Byte-accurate slice: never exceeds the cap, never cuts a multibyte
+          // character (CJK) or surrogate pair (emoji) in half.
+          let slice = this.#byteCappedPrefix(remaining, maxChunkBytes);
+          // Try to break at a whitespace boundary near the end for readability,
+          // but only when text remains after this slice.
+          if (slice.length < remaining.length) {
+            const lastSpace = slice.lastIndexOf(" ");
+            const lastNewline = slice.lastIndexOf("\n");
+            const breakPoint = Math.max(lastSpace, lastNewline);
+            if (breakPoint > slice.length * WHITESPACE_BREAK_RATIO) {
+              slice = slice.slice(0, breakPoint);
+            }
+          }
+          const linePartTitle = partIndex === 1 && linePart === 1
+            ? titlePrefix
+            : `${titlePrefix} (${partIndex}.${linePart})`;
+          subChunks.push({ title: linePartTitle, content: slice });
+          remaining = remaining.slice(slice.length);
+          linePart++;
+          partIndex++;
+        }
+        continue;
+      }
+
+      const candidate = accumulator.length > 0
+        ? accumulator.join("\n") + "\n" + line
+        : line;
+
+      // If adding this line would exceed the cap, flush accumulator first
+      if (Buffer.byteLength(candidate) > maxChunkBytes && accumulator.length > 0) {
+        flushAccumulator();
+      }
+      accumulator.push(line);
+    }
+    flushAccumulator();
+    return subChunks;
+  }
+
   #chunkPlainText(
     text: string,
     linesPerChunk: number,
+    maxChunkBytes: number = MAX_CHUNK_BYTES,
   ): Array<{ title: string; content: string }> {
     // Try blank-line splitting first for naturally-sectioned output
     const sections = text.split(/\n\s*\n/);
     if (
-      sections.length >= 3 &&
-      sections.length <= 200 &&
-      sections.every((s) => Buffer.byteLength(s) < 5000)
+      sections.length >= MIN_BLANK_LINE_SECTIONS &&
+      sections.length <= MAX_BLANK_LINE_SECTIONS &&
+      sections.every((s) => Buffer.byteLength(s) < BLANK_SECTION_STRATEGY_MAX_BYTES)
     ) {
-      return sections
-        .map((section, i) => {
-          const trimmed = section.trim();
-          const firstLine = trimmed.split("\n")[0].slice(0, 80);
-          return {
-            title: firstLine || `Section ${i + 1}`,
-            content: trimmed,
-          };
-        })
-        .filter((s) => s.content.length > 0);
+      return sections.flatMap((section, i) => {
+        const trimmed = section.trim();
+        if (trimmed.length === 0) return [];
+        const title = trimmed.split("\n")[0].slice(0, CHUNK_TITLE_MAX_CHARS) || `Section ${i + 1}`;
+        // A section may pass the strategy guard yet still exceed the byte cap
+        // (4097–4999B band): sub-split it so no stored chunk breaks the cap.
+        if (Buffer.byteLength(trimmed) <= maxChunkBytes) {
+          return [{ title, content: trimmed }];
+        }
+        return this.#splitOversizedPlainChunk(trimmed.split("\n"), title, maxChunkBytes);
+      });
     }
 
     const lines = text.split("\n");
 
-    // Small enough for a single chunk
+    // Small enough for a single chunk — but still enforce byte cap
     if (lines.length <= linesPerChunk) {
-      return [{ title: "Output", content: text }];
+      if (Buffer.byteLength(text) <= maxChunkBytes) {
+        return [{ title: "Output", content: text }];
+      }
+      return this.#splitOversizedPlainChunk(lines, "Output", maxChunkBytes);
     }
 
     // Fixed-size line groups with 2-line overlap
@@ -1623,11 +1900,23 @@ export class ContentStore {
       if (slice.length === 0) break;
       const startLine = i + 1;
       const endLine = Math.min(i + slice.length, lines.length);
-      const firstLine = slice[0]?.trim().slice(0, 80);
-      chunks.push({
-        title: firstLine || `Lines ${startLine}-${endLine}`,
-        content: slice.join("\n"),
-      });
+      const firstLine = slice[0]?.trim().slice(0, CHUNK_TITLE_MAX_CHARS);
+      const joined = slice.join("\n");
+
+      // Enforce byte cap: sub-split oversized line-group chunks
+      if (Buffer.byteLength(joined) <= maxChunkBytes) {
+        chunks.push({
+          title: firstLine || `Lines ${startLine}-${endLine}`,
+          content: joined,
+        });
+      } else {
+        const subChunks = this.#splitOversizedPlainChunk(
+          slice,
+          firstLine || `Lines ${startLine}-${endLine}`,
+          maxChunkBytes,
+        );
+        chunks.push(...subChunks);
+      }
     }
 
     return chunks;

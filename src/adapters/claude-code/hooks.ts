@@ -1,4 +1,4 @@
-import { buildNodeCommand } from "../types.js";
+import { buildHookRuntimeCommand, parseNodeCommand } from "../types.js";
 
 /**
  * adapters/claude-code/hooks — Claude Code hook definitions and matchers.
@@ -29,6 +29,7 @@ export const HOOK_TYPES = {
   PRE_COMPACT: "PreCompact",
   SESSION_START: "SessionStart",
   USER_PROMPT_SUBMIT: "UserPromptSubmit",
+  STOP: "Stop",
 } as const;
 
 export type HookType = (typeof HOOK_TYPES)[keyof typeof HOOK_TYPES];
@@ -36,6 +37,21 @@ export type HookType = (typeof HOOK_TYPES)[keyof typeof HOOK_TYPES];
 // ─────────────────────────────────────────────────────────
 // PreToolUse matchers
 // ─────────────────────────────────────────────────────────
+
+/**
+ * External MCP catch-all matcher for Claude Code (#529, #547 hotfix).
+ *
+ * Claude Code's hook matcher engine treats this entry as a substring match
+ * (it also accepts regex, but `mcp__` alone is enough — every MCP tool
+ * surfaces as `mcp__<server>__<tool>`). v1.0.124 used a negative lookahead
+ * `mcp__(?!plugin_context-mode_)` to skip context-mode's own MCP tools,
+ * but this same hooks.json is bundled to Codex CLI which uses Rust's
+ * `regex` crate (no look-around support) — Codex rejected the matcher at
+ * boot, breaking every Codex user (#547). Drop the lookaround on both
+ * sides; the hook BODY (`isExternalMcpTool()` in hooks/core/routing.mjs)
+ * already filters context-mode's own tools, so semantics are preserved.
+ */
+export const EXTERNAL_MCP_MATCHER_PATTERN = "mcp__";
 
 /** Tools that context-mode's PreToolUse hook intercepts. */
 export const PRE_TOOL_USE_MATCHERS = [
@@ -47,6 +63,7 @@ export const PRE_TOOL_USE_MATCHERS = [
   "mcp__plugin_context-mode_context-mode__ctx_execute",
   "mcp__plugin_context-mode_context-mode__ctx_execute_file",
   "mcp__plugin_context-mode_context-mode__ctx_batch_execute",
+  EXTERNAL_MCP_MATCHER_PATTERN,
 ] as const;
 
 /**
@@ -100,6 +117,7 @@ export const HOOK_SCRIPTS: Record<HookType, string> = {
   PreCompact: "precompact.mjs",
   SessionStart: "sessionstart.mjs",
   UserPromptSubmit: "userpromptsubmit.mjs",
+  Stop: "stop.mjs",
 };
 
 // ─────────────────────────────────────────────────────────
@@ -117,6 +135,7 @@ export const OPTIONAL_HOOKS: HookType[] = [
   HOOK_TYPES.POST_TOOL_USE,
   HOOK_TYPES.PRE_COMPACT,
   HOOK_TYPES.USER_PROMPT_SUBMIT,
+  HOOK_TYPES.STOP,
 ];
 
 /**
@@ -146,26 +165,35 @@ export function isContextModeHook(
 export function buildHookCommand(hookType: HookType, pluginRoot?: string): string {
   if (pluginRoot) {
     const scriptName = HOOK_SCRIPTS[hookType];
-    return buildNodeCommand(`${pluginRoot}/hooks/${scriptName}`);
+    return buildHookRuntimeCommand(`${pluginRoot}/hooks/${scriptName}`);
   }
   return `context-mode hook claude-code ${hookType.toLowerCase()}`;
 }
 
 /**
  * Extract the hook script file path from a command string.
- * Returns the path if the command uses the `node "/path/to/hook.mjs"` format
- * or the new `"/path/to/node" "/path/to/hook.mjs"` format (#369, #372),
- * or null if it uses the CLI dispatcher format (which is path-independent).
  *
- * Handles both quoted and unquoted paths, and both forward/back slashes.
+ * Algo-D2 twin — same shape as `src/util/hook-config.ts::extractHookScriptPath`.
+ * Delegates to `parseNodeCommand` for canonical buildNodeCommand-shape;
+ * keeps narrow legacy fallbacks for pre-D3 settings.json entries
+ * (`node "X.mjs"` and `node X.mjs` with no internal whitespace).
+ *
+ * Pre-D2 this matched `node\s+"?([^"]+\.mjs)"?` — the unquoted fallback
+ * silently grabbed the tail after the last whitespace, producing the
+ * #548 doubled-path FAIL on Windows paths with spaces. The new shape
+ * refuses ambiguous input; doctor (Algo-D1) falls through to direct
+ * `existsSync` instead of trusting the regex.
  */
 export function extractHookScriptPath(command: string): string | null {
-  // New format: "nodePath" "scriptPath.mjs" (from buildNodeCommand)
-  const newFmt = command.match(/"[^"]+"\s+"([^"]+\.mjs)"/);
-  if (newFmt) return newFmt[1];
-  // Legacy format: node "/path/to/hooks/scriptname.mjs" or node /path/to/hooks/scriptname.mjs
-  const match = command.match(/node\s+"?([^"]+\.mjs)"?/);
-  return match?.[1] ?? null;
+  const parsed = parseNodeCommand(command);
+  if (parsed) {
+    return parsed.scriptPath.endsWith(".mjs") ? parsed.scriptPath : null;
+  }
+  const legacyQuoted = command.match(/^\s*node\s+"([^"]+\.mjs)"\s*$/);
+  if (legacyQuoted) return legacyQuoted[1];
+  const legacyBare = command.match(/^\s*node\s+(\S+\.mjs)\s*$/);
+  if (legacyBare) return legacyBare[1];
+  return null;
 }
 
 /**

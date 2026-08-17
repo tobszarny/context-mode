@@ -282,9 +282,13 @@ describe("Git Events", () => {
     };
 
     const events = extractEvents(input);
-    const gitEvents = events.filter(e => e.type === "git");
-    assert.equal(gitEvents.length, 1);
-    assert.equal(gitEvents[0].data, "commit");
+    // v1.0.161: commits with a -m message surface as type='git_commit' so the
+    // rollup aggregator can distinguish actual commits from other git ops.
+    // category stays 'git' for downstream consumers that filter by category.
+    const gitCategoryEvents = events.filter(e => e.category === "git");
+    assert.equal(gitCategoryEvents.length, 1);
+    assert.equal(gitCategoryEvents[0].type, "git_commit");
+    assert.equal(gitCategoryEvents[0].data, "feat: add session continuity");
   });
 
   test("extracts git event from push command", () => {
@@ -554,8 +558,10 @@ describe("Decision Events", () => {
     assert.ok(decisionEvents[0].data.includes("ctx-"));
   });
 
-  test("extracts decision from 'always/never' directives", () => {
-    const events = extractUserEvents("never push to main without asking me first");
+  test("extracts decision from a negation+alternative correction", () => {
+    // Universal-rule detector (issue #535) treats a clause-separated
+    // non-question message in the corrective length range as a decision.
+    const events = extractUserEvents("never push to main, ask me first");
     const decisionEvents = events.filter(e => e.type === "decision");
     assert.equal(decisionEvents.length, 1);
   });
@@ -785,19 +791,11 @@ describe("Intent Events", () => {
     assert.equal(intentEvents[0].data, "implement");
   });
 
-  test("extracts review intent", () => {
-    const events = extractUserEvents("Review this code and check for security issues");
-    const intentEvents = events.filter(e => e.type === "intent");
-    assert.equal(intentEvents.length, 1);
-    assert.equal(intentEvents[0].data, "review");
-  });
-
-  test("extracts discussion intent", () => {
-    const events = extractUserEvents("Think about the pros and cons of this approach");
-    const intentEvents = events.filter(e => e.type === "intent");
-    assert.equal(intentEvents.length, 1);
-    assert.equal(intentEvents[0].data, "discuss");
-  });
+  // The `review` and `discuss` modes were keyword-only and could not be
+  // expressed as a robust universal-rule detector (issue #535). They are
+  // intentionally dropped from the intent schema — the renderer now
+  // surfaces the raw user message via <recent_user_messages> so the
+  // next LLM can still distinguish review/discuss tone end-to-end.
 });
 
 // ════════════════════════════════════════════
@@ -970,6 +968,158 @@ describe("AskUserQuestion Events", () => {
     assert.equal(decisionEvents[0].category, "decision");
     assert.equal(decisionEvents[0].priority, 2);
     assert.ok(decisionEvents[0].data.includes("database"), "should include question text");
+    // The selected option label MUST appear as the answer.
+    assert.ok(
+      decisionEvents[0].data.includes("PostgreSQL"),
+      "should include the selected answer label",
+    );
+    // The raw answers map must NOT leak into the event data.
+    assert.ok(
+      !decisionEvents[0].data.includes('"answers"'),
+      "must not embed the raw answers map",
+    );
+  });
+
+  test("extracts only the selected label when tool_response echoes the request payload", () => {
+    // Real Claude Code harness shape: the tool_response echoes the full
+    // request (questions + options) alongside the answers map. The extractor
+    // must NOT leak the echoed payload into the event data — that's what
+    // produced "Unhandled case: [object Object]" toasts on SessionStart.
+    const QUESTION = "Which database should we use?";
+    const SELECTED = "PostgreSQL";
+    const input = {
+      tool_name: "AskUserQuestion",
+      tool_input: {
+        questions: [
+          {
+            question: QUESTION,
+            header: "Database",
+            options: [
+              { label: "PostgreSQL", description: "Relational DB" },
+              { label: "MongoDB", description: "Document DB" },
+            ],
+            multiSelect: false,
+          },
+        ],
+      },
+      tool_response: JSON.stringify({
+        questions: [
+          {
+            question: QUESTION,
+            header: "Database",
+            options: [
+              { label: "PostgreSQL", description: "Relational DB" },
+              { label: "MongoDB", description: "Document DB" },
+            ],
+            multiSelect: false,
+          },
+        ],
+        answers: { [QUESTION]: SELECTED },
+      }),
+    };
+
+    const events = extractEvents(input);
+    const decisionEvents = events.filter(e => e.type === "decision_question");
+    assert.equal(decisionEvents.length, 1);
+    assert.equal(decisionEvents[0].data, `Q: ${QUESTION} → A: ${SELECTED}`);
+    // Must not embed the echoed request payload.
+    assert.ok(
+      !decisionEvents[0].data.includes('"questions":['),
+      "must not embed the echoed questions array",
+    );
+    assert.ok(
+      !decisionEvents[0].data.includes('"options":['),
+      "must not embed the echoed options array",
+    );
+    assert.ok(
+      !decisionEvents[0].data.includes("[object Object]"),
+      "must not stringify objects as [object Object]",
+    );
+  });
+
+  test("falls back safely when tool_response is not valid JSON", () => {
+    const input = {
+      tool_name: "AskUserQuestion",
+      tool_input: {
+        questions: [
+          {
+            question: "Pick one",
+            header: "Choice",
+            options: [{ label: "A", description: "" }],
+            multiSelect: false,
+          },
+        ],
+      },
+      tool_response: "not-json at all { broken",
+    };
+
+    const events = extractEvents(input);
+    const decisionEvents = events.filter(e => e.type === "decision_question");
+    assert.equal(decisionEvents.length, 1);
+    // Empty answer rather than leaking the malformed raw text.
+    assert.equal(decisionEvents[0].data, "Q: Pick one → A: ");
+    assert.ok(
+      !decisionEvents[0].data.includes("not-json"),
+      "must not leak the raw non-JSON response",
+    );
+  });
+
+  test("joins multi-select string-array answers", () => {
+    // multiSelect: true on the request means the harness returns the answer
+    // as a string[] in the answers map. Without array handling the extractor
+    // would emit an empty answer despite a valid selection — regression caught
+    // by CodeRabbit on the original fix PR.
+    const QUESTION = "Pick features";
+    const input = {
+      tool_name: "AskUserQuestion",
+      tool_input: {
+        questions: [
+          {
+            question: QUESTION,
+            header: "Features",
+            options: [
+              { label: "Auth", description: "" },
+              { label: "Billing", description: "" },
+              { label: "Reporting", description: "" },
+            ],
+            multiSelect: true,
+          },
+        ],
+      },
+      tool_response: JSON.stringify({
+        answers: { [QUESTION]: ["Auth", "Reporting"] },
+      }),
+    };
+
+    const events = extractEvents(input);
+    const decisionEvents = events.filter(e => e.type === "decision_question");
+    assert.equal(decisionEvents.length, 1);
+    assert.equal(decisionEvents[0].data, `Q: ${QUESTION} → A: Auth | Reporting`);
+  });
+
+  test("falls back to joined answer values when question text does not match a key", () => {
+    // Defensive: if the harness ever sends an answers map keyed differently
+    // from the question text (renamed key, locale variation), recover the
+    // string values rather than leaving the answer empty.
+    const input = {
+      tool_name: "AskUserQuestion",
+      tool_input: {
+        questions: [
+          {
+            question: "Original question",
+            header: "Q",
+            options: [{ label: "Yes", description: "" }],
+            multiSelect: false,
+          },
+        ],
+      },
+      tool_response: JSON.stringify({ answers: { "Renamed key": "Yes" } }),
+    };
+
+    const events = extractEvents(input);
+    const decisionEvents = events.filter(e => e.type === "decision_question");
+    assert.equal(decisionEvents.length, 1);
+    assert.equal(decisionEvents[0].data, "Q: Original question → A: Yes");
   });
 
   test("non-AskUserQuestion tool does not produce decision_question", () => {
@@ -1960,6 +2110,34 @@ describe("External Ref Events", () => {
     assert.ok(refs[0].data.includes("github.com/user/repo/pull/100"), "should include PR URL");
     assert.ok(refs[0].data.includes("docs.example.com"), "should include doc URL");
   });
+
+  test("attaches bytes_avoided parsed from ctx_fetch_and_index preamble", () => {
+    // SLICE 2: when a ctx_fetch_and_index call returns its single-fetch
+    // preamble ("Fetched and indexed **N sections** (XKB) from: ..."),
+    // the external_ref event must carry the bytes-avoided figure so the
+    // honest-savings stats line is non-zero. Without this, indexed bytes
+    // never reach the session_events.bytes_avoided column.
+    const input = {
+      tool_name: "mcp__plugin_context-mode_context-mode__ctx_fetch_and_index",
+      tool_input: { url: "https://example.com/guide" },
+      tool_response:
+        "Fetched and indexed **5 sections** (47.50KB) from: example-guide\n" +
+        "Full content indexed in sandbox — use ctx_search(queries: [...], source: \"example-guide\") for specific lookups.\n" +
+        "\n---\n\n" +
+        "Visit https://example.com/guide for the full doc.",
+    };
+
+    const events = extractEvents(input);
+    const refs = events.filter((e) => e.type === "external_ref");
+    assert.equal(refs.length, 1, "external_ref should fire on the preamble");
+    const ref = refs[0] as { type: string; data: string; bytes_avoided?: number };
+    assert.ok(
+      typeof ref.bytes_avoided === "number" && ref.bytes_avoided > 0,
+      `expected bytes_avoided > 0, got ${ref.bytes_avoided}`,
+    );
+    // 47.50KB = 47.50 * 1024 = 48640 bytes
+    assert.equal(ref.bytes_avoided, Math.round(47.5 * 1024));
+  });
 });
 
 // ════════════════════════════════════════════
@@ -2488,95 +2666,60 @@ describe("Iteration Loop Events", () => {
 // ════════════════════════════════════════════
 
 describe("Blocked-On Events", () => {
-  test("extracts blocker from 'blocked on' pattern", () => {
-    const events = extractUserEvents("I'm blocked on the API key from DevOps");
+  // Migrated to universal-rule detectors (issue #535). The old English
+  // and Turkish keyword fixtures ("blocked on", "waiting for",
+  // "bekliyor", "unblocked", ...) are intentionally no longer matched —
+  // the universal-rule design relies on language-neutral
+  // programming-domain markers (Error: / Exception: / Traceback / stack
+  // frames) and Unicode checkmark / "fixed:" / "resolved:" prefixes.
+  // For raw-message preservation see the <recent_user_messages>
+  // safety-net section in tests/session/extract-multilang.test.ts.
+
+  test("extracts blocker from 'Error:' programming-domain marker", () => {
+    const events = extractUserEvents("Error: cannot read property of undefined");
     const blockerEvents = events.filter(e => e.type === "blocker");
     assert.equal(blockerEvents.length, 1);
     assert.equal(blockerEvents[0].category, "blocked-on");
     assert.equal(blockerEvents[0].priority, 2);
-    assert.ok(blockerEvents[0].data.includes("API key"));
+    assert.ok(blockerEvents[0].data.includes("cannot read property"));
   });
 
-  test("extracts blocker from 'waiting for' pattern", () => {
-    const events = extractUserEvents("waiting for the design review to finish");
+  test("extracts blocker from 'Exception:' marker", () => {
+    const events = extractUserEvents("Exception: NullPointerException at line 42");
     const blockerEvents = events.filter(e => e.type === "blocker");
     assert.equal(blockerEvents.length, 1);
     assert.equal(blockerEvents[0].category, "blocked-on");
   });
 
-  test("extracts blocker from 'need X before' pattern", () => {
-    const events = extractUserEvents("need approval before we can deploy");
+  test("extracts blocker from Python 'Traceback' marker", () => {
+    const events = extractUserEvents("Traceback (most recent call last):");
     const blockerEvents = events.filter(e => e.type === "blocker");
     assert.equal(blockerEvents.length, 1);
   });
 
-  test("extracts blocker from 'can't proceed until' pattern", () => {
-    const events = extractUserEvents("can't proceed until the migration is done");
-    const blockerEvents = events.filter(e => e.type === "blocker");
-    assert.equal(blockerEvents.length, 1);
-  });
-
-  test("extracts blocker from 'depends on' pattern", () => {
-    const events = extractUserEvents("this depends on the auth service being up");
-    const blockerEvents = events.filter(e => e.type === "blocker");
-    assert.equal(blockerEvents.length, 1);
-  });
-
-  test("extracts blocker from bare 'blocked' pattern", () => {
-    const events = extractUserEvents("we're blocked, CI is failing");
-    const blockerEvents = events.filter(e => e.type === "blocker");
-    assert.equal(blockerEvents.length, 1);
-  });
-
-  test("extracts blocker from Turkish 'bekliyor' pattern", () => {
-    const events = extractUserEvents("deployment bekliyor, önce review lazım");
-    const blockerEvents = events.filter(e => e.type === "blocker");
-    assert.equal(blockerEvents.length, 1);
-  });
-
-  test("extracts blocker from Turkish 'bekliyorum' pattern", () => {
-    const events = extractUserEvents("API anahtarını bekliyorum");
-    const blockerEvents = events.filter(e => e.type === "blocker");
-    assert.equal(blockerEvents.length, 1);
-  });
-
-  // Resolution tests
-
-  test("extracts blocker_resolved from 'unblocked' pattern", () => {
-    const events = extractUserEvents("we're unblocked now, got the credentials");
+  test("extracts blocker_resolved from Unicode checkmark", () => {
+    const events = extractUserEvents("✅ unblocked now, got the credentials");
     const resolvedEvents = events.filter(e => e.type === "blocker_resolved");
     assert.equal(resolvedEvents.length, 1);
     assert.equal(resolvedEvents[0].category, "blocked-on");
     assert.equal(resolvedEvents[0].priority, 2);
   });
 
-  test("extracts blocker_resolved from 'resolved' pattern", () => {
-    const events = extractUserEvents("the issue is resolved, we can continue");
+  test("extracts blocker_resolved from 'fixed:' marker prefix", () => {
+    const events = extractUserEvents("fixed: the cache miss in dev");
     const resolvedEvents = events.filter(e => e.type === "blocker_resolved");
     assert.equal(resolvedEvents.length, 1);
   });
 
-  test("extracts blocker_resolved from 'got the X' pattern", () => {
-    const events = extractUserEvents("got the API key, let's go");
+  test("extracts blocker_resolved from 'resolved:' marker prefix", () => {
+    const events = extractUserEvents("resolved: deploy queue cleared");
     const resolvedEvents = events.filter(e => e.type === "blocker_resolved");
     assert.equal(resolvedEvents.length, 1);
   });
 
-  test("extracts blocker_resolved from 'is ready now' pattern", () => {
-    const events = extractUserEvents("the staging environment is ready now");
-    const resolvedEvents = events.filter(e => e.type === "blocker_resolved");
-    assert.equal(resolvedEvents.length, 1);
-  });
-
-  test("extracts blocker_resolved from 'can proceed' pattern", () => {
-    const events = extractUserEvents("we can proceed with the deployment");
-    const resolvedEvents = events.filter(e => e.type === "blocker_resolved");
-    assert.equal(resolvedEvents.length, 1);
-  });
-
-  test("resolution takes priority over blocker when both match", () => {
-    // "resolved" matches resolution, "blocked" matches blocker — resolution wins
-    const events = extractUserEvents("the blocked issue is now resolved");
+  test("resolution takes priority over blocker when both shapes match", () => {
+    // checkmark wins over Error: marker in the same message
+    const events = extractUserEvents("✅ Error: was a stale build, fixed it");
     const resolvedEvents = events.filter(e => e.type === "blocker_resolved");
     const blockerEvents = events.filter(e => e.type === "blocker");
     assert.equal(resolvedEvents.length, 1, "should emit resolved");

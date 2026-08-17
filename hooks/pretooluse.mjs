@@ -28,7 +28,7 @@ await runHook(async () => {
   const { readStdin } = await import("./core/stdin.mjs");
   const { routePreToolUse, initSecurity } = await import("./core/routing.mjs");
   const { formatDecision } = await import("./core/formatters.mjs");
-  const { parseStdin, getSessionId, resolveConfigDir } = await import("./session-helpers.mjs");
+  const { parseStdin, getInputProjectDir, getSessionId, resolveConfigDir } = await import("./session-helpers.mjs");
 
   // ─── Manual recursive copy (avoids cpSync libuv crash on non-ASCII paths, Windows + Node 24) ───
   function copyDirSync(src, dest) {
@@ -127,7 +127,15 @@ await runHook(async () => {
                   // Extract the script filename (e.g., sessionstart.mjs, pretooluse.mjs)
                   const scriptMatch = h.command.match(/([a-z]+\.mjs)\s*"?\s*$/);
                   if (scriptMatch) {
-                    h.command = "node " + resolve(targetDir, "hooks", scriptMatch[1]);
+                    // Issue #636: quote the script path so spaces in targetDir
+                    // (e.g. Dropbox/iCloud display names like "Lucas Werneck",
+                    // or CLAUDE_CONFIG_DIR pointed at a synced spaced folder)
+                    // don't break /bin/sh's word-splitting at hook-spawn time.
+                    // JSON.stringify is sufficient on Unix and safe on Windows
+                    // (backslashes get escaped — Claude Code's hook layer
+                    //  normalizes to POSIX on Windows anyway via toHookPath).
+                    const scriptPath = resolve(targetDir, "hooks", scriptMatch[1]);
+                    h.command = `node ${JSON.stringify(scriptPath)}`;
                     changed = true;
                   }
                 }
@@ -155,9 +163,13 @@ await runHook(async () => {
   const input = parseStdin(raw);
   const tool = input.tool_name ?? "";
   const toolInput = input.tool_input ?? {};
+  const projectDir = getInputProjectDir(input);
+  const isSubagentContext = input.agent_id != null || input.agent_type != null;
 
   // ─── Route and format response ───
-  const decision = routePreToolUse(tool, toolInput, process.env.CLAUDE_PROJECT_DIR, "claude-code", getSessionId(input));
+  const decision = routePreToolUse(tool, toolInput, projectDir, "claude-code", getSessionId(input), {
+    mcpToolsAvailable: !isSubagentContext,
+  });
   const response = formatDecision("claude-code", decision);
 
   // ─── Write latency marker for cross-hook timing (Category 27) ───

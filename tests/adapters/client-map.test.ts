@@ -50,6 +50,34 @@ describe("CLIENT_NAME_TO_PLATFORM", () => {
     expect(CLIENT_NAME_TO_PLATFORM["PyCharm"]).toBe("jetbrains-copilot");
   });
 
+  // Issue #542 — Pi → OMP rebrand. Current upstream
+  // refs/platforms/oh-my-pi/packages/coding-agent/src/mcp/client.ts:46-49
+  // ships clientInfo.name = "omp-coding-agent". Older installs still send
+  // "Pi CLI" or "Pi Coding Agent". All three coexist.
+  it('maps "omp-coding-agent" to "omp" (rebrand canonical name)', () => {
+    expect(CLIENT_NAME_TO_PLATFORM["omp-coding-agent"]).toBe("omp");
+  });
+
+  it('maps "Pi CLI" to "pi" (legacy install)', () => {
+    expect(CLIENT_NAME_TO_PLATFORM["Pi CLI"]).toBe("pi");
+  });
+
+  it('maps "Pi Coding Agent" to "pi" (legacy install)', () => {
+    expect(CLIENT_NAME_TO_PLATFORM["Pi Coding Agent"]).toBe("pi");
+  });
+
+  it('maps "kimi-code" to "kimi"', () => {
+    expect(CLIENT_NAME_TO_PLATFORM["kimi-code"]).toBe("kimi");
+  });
+
+  it('maps "kimi" to "kimi"', () => {
+    expect(CLIENT_NAME_TO_PLATFORM["kimi"]).toBe("kimi");
+  });
+
+  it('maps "Kimi Code" to "kimi"', () => {
+    expect(CLIENT_NAME_TO_PLATFORM["Kimi Code"]).toBe("kimi");
+  });
+
   it("returns undefined for unknown client name", () => {
     expect(CLIENT_NAME_TO_PLATFORM["some-unknown-client"]).toBeUndefined();
   });
